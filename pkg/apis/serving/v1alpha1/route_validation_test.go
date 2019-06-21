@@ -17,13 +17,15 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/knative/pkg/apis"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/knative/pkg/apis"
+	"github.com/knative/serving/pkg/apis/serving/v1beta1"
 )
 
 func TestRouteValidation(t *testing.T) {
@@ -34,10 +36,15 @@ func TestRouteValidation(t *testing.T) {
 	}{{
 		name: "valid",
 		r: &Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: RouteSpec{
 				Traffic: []TrafficTarget{{
-					RevisionName: "foo",
-					Percent:      100,
+					TrafficTarget: v1beta1.TrafficTarget{
+						RevisionName: "foo",
+						Percent:      100,
+					},
 				}},
 			},
 		},
@@ -45,15 +52,22 @@ func TestRouteValidation(t *testing.T) {
 	}, {
 		name: "valid split",
 		r: &Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: RouteSpec{
 				Traffic: []TrafficTarget{{
-					Name:         "prod",
-					RevisionName: "foo",
-					Percent:      90,
+					DeprecatedName: "prod",
+					TrafficTarget: v1beta1.TrafficTarget{
+						RevisionName: "foo",
+						Percent:      90,
+					},
 				}, {
-					Name:              "experiment",
-					ConfigurationName: "bar",
-					Percent:           10,
+					DeprecatedName: "experiment",
+					TrafficTarget: v1beta1.TrafficTarget{
+						ConfigurationName: "bar",
+						Percent:           10,
+					},
 				}},
 			},
 		},
@@ -61,10 +75,15 @@ func TestRouteValidation(t *testing.T) {
 	}, {
 		name: "invalid traffic entry",
 		r: &Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: RouteSpec{
 				Traffic: []TrafficTarget{{
-					Name:    "foo",
-					Percent: 100,
+					DeprecatedName: "foo",
+					TrafficTarget: v1beta1.TrafficTarget{
+						Percent: 100,
+					},
 				}},
 			},
 		},
@@ -83,12 +102,17 @@ func TestRouteValidation(t *testing.T) {
 			},
 			Spec: RouteSpec{
 				Traffic: []TrafficTarget{{
-					RevisionName: "foo",
-					Percent:      100,
+					TrafficTarget: v1beta1.TrafficTarget{
+						RevisionName: "foo",
+						Percent:      100,
+					},
 				}},
 			},
 		},
-		want: &apis.FieldError{Message: "Invalid resource name: special character . must not be present", Paths: []string{"metadata.name"}},
+		want: &apis.FieldError{
+			Message: "not a DNS 1035 label: [a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character (e.g. 'my-name',  or 'abc-123', regex used for validation is '[a-z]([-a-z0-9]*[a-z0-9])?')]",
+			Paths:   []string{"metadata.name"},
+		},
 	}, {
 		name: "invalid name - dots and spec percent is not 100",
 		r: &Route{
@@ -97,32 +121,44 @@ func TestRouteValidation(t *testing.T) {
 			},
 			Spec: RouteSpec{
 				Traffic: []TrafficTarget{{
-					RevisionName: "foo",
-					Percent:      90,
+					TrafficTarget: v1beta1.TrafficTarget{
+						RevisionName: "foo",
+						Percent:      90,
+					},
 				}},
 			},
 		},
-		want: (&apis.FieldError{Message: "Invalid resource name: special character . must not be present", Paths: []string{"metadata.name"}}).
-			Also(&apis.FieldError{Message: "Traffic targets sum to 90, want 100", Paths: []string{"spec.traffic"}}),
+		want: (&apis.FieldError{
+			Message: "not a DNS 1035 label: [a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character (e.g. 'my-name',  or 'abc-123', regex used for validation is '[a-z]([-a-z0-9]*[a-z0-9])?')]",
+			Paths:   []string{"metadata.name"},
+		}).Also(&apis.FieldError{
+			Message: "Traffic targets sum to 90, want 100",
+			Paths:   []string{"spec.traffic"},
+		}),
 	}, {
 		name: "invalid name - too long",
 		r: &Route{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: strings.Repeat("a", 65),
+				Name: strings.Repeat("a", 64),
 			},
 			Spec: RouteSpec{
 				Traffic: []TrafficTarget{{
-					RevisionName: "foo",
-					Percent:      100,
+					TrafficTarget: v1beta1.TrafficTarget{
+						RevisionName: "foo",
+						Percent:      100,
+					},
 				}},
 			},
 		},
-		want: &apis.FieldError{Message: "Invalid resource name: length must be no more than 63 characters", Paths: []string{"metadata.name"}},
+		want: &apis.FieldError{
+			Message: "not a DNS 1035 label: [must be no more than 63 characters]",
+			Paths:   []string{"metadata.name"},
+		},
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.r.Validate()
+			got := test.r.Validate(context.Background())
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
@@ -131,6 +167,10 @@ func TestRouteValidation(t *testing.T) {
 }
 
 func TestRouteSpecValidation(t *testing.T) {
+	multipleDefinitionError := &apis.FieldError{
+		Message: `Multiple definitions for "foo"`,
+		Paths:   []string{"traffic[0].name", "traffic[1].name"},
+	}
 	tests := []struct {
 		name string
 		rs   *RouteSpec
@@ -139,8 +179,10 @@ func TestRouteSpecValidation(t *testing.T) {
 		name: "valid",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				RevisionName: "foo",
-				Percent:      100,
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "foo",
+					Percent:      100,
+				},
 			}},
 		},
 		want: nil,
@@ -148,13 +190,17 @@ func TestRouteSpecValidation(t *testing.T) {
 		name: "valid split",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				Name:         "prod",
-				RevisionName: "foo",
-				Percent:      90,
+				DeprecatedName: "prod",
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "foo",
+					Percent:      90,
+				},
 			}, {
-				Name:              "experiment",
-				ConfigurationName: "bar",
-				Percent:           10,
+				DeprecatedName: "experiment",
+				TrafficTarget: v1beta1.TrafficTarget{
+					ConfigurationName: "bar",
+					Percent:           10,
+				},
 			}},
 		},
 		want: nil,
@@ -166,8 +212,10 @@ func TestRouteSpecValidation(t *testing.T) {
 		name: "invalid traffic entry",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				Name:    "foo",
-				Percent: 100,
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					Percent: 100,
+				},
 			}},
 		},
 		want: &apis.FieldError{
@@ -181,8 +229,10 @@ func TestRouteSpecValidation(t *testing.T) {
 		name: "invalid revision name",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				RevisionName: "b@r",
-				Percent:      100,
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "b@r",
+					Percent:      100,
+				},
 			}},
 		},
 		want: &apis.FieldError{
@@ -194,8 +244,10 @@ func TestRouteSpecValidation(t *testing.T) {
 		name: "invalid revision name",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				ConfigurationName: "f**",
-				Percent:           100,
+				TrafficTarget: v1beta1.TrafficTarget{
+					ConfigurationName: "f**",
+					Percent:           100,
+				},
 			}},
 		},
 		want: &apis.FieldError{
@@ -207,53 +259,117 @@ func TestRouteSpecValidation(t *testing.T) {
 		name: "invalid name conflict",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				Name:         "foo",
-				RevisionName: "bar",
-				Percent:      50,
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "bar",
+					Percent:      50,
+				},
 			}, {
-				Name:         "foo",
-				RevisionName: "baz",
-				Percent:      50,
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "baz",
+					Percent:      50,
+				},
 			}},
 		},
-		want: &apis.FieldError{
-			Message: `Multiple definitions for "foo"`,
-			Paths:   []string{"traffic[0].name", "traffic[1].name"},
-		},
+		want: multipleDefinitionError,
 	}, {
-		name: "valid name collision (same revision)",
+		name: "collision (same revision)",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				Name:         "foo",
-				RevisionName: "bar",
-				Percent:      50,
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "bar",
+					Percent:      50,
+				},
 			}, {
-				Name:         "foo",
-				RevisionName: "bar",
-				Percent:      50,
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "bar",
+					Percent:      50,
+				},
 			}},
 		},
-		want: nil,
+		want: multipleDefinitionError,
+	}, {
+		name: "collision (same config)",
+		rs: &RouteSpec{
+			Traffic: []TrafficTarget{{
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					ConfigurationName: "bar",
+					Percent:           50,
+				},
+			}, {
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					ConfigurationName: "bar",
+					Percent:           50,
+				},
+			}},
+		},
+		want: multipleDefinitionError,
 	}, {
 		name: "invalid total percentage",
 		rs: &RouteSpec{
 			Traffic: []TrafficTarget{{
-				RevisionName: "bar",
-				Percent:      99,
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "bar",
+					Percent:      99,
+				},
 			}, {
-				RevisionName: "baz",
-				Percent:      99,
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "baz",
+					Percent:      99,
+				},
 			}},
 		},
 		want: &apis.FieldError{
 			Message: "Traffic targets sum to 198, want 100",
 			Paths:   []string{"traffic"},
 		},
+	}, {
+		name: "multiple names",
+		rs: &RouteSpec{
+			Traffic: []TrafficTarget{{
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					Tag:          "foo",
+					RevisionName: "bar",
+					Percent:      100,
+				},
+			}},
+		},
+		want: apis.ErrMultipleOneOf("traffic[0].name", "traffic[0].tag"),
+	}, {
+		name: "conflicting with different names",
+		rs: &RouteSpec{
+			Traffic: []TrafficTarget{{
+				DeprecatedName: "foo",
+				TrafficTarget: v1beta1.TrafficTarget{
+					RevisionName: "bar",
+					Percent:      50,
+				},
+			}, {
+				TrafficTarget: v1beta1.TrafficTarget{
+					Tag:          "foo",
+					RevisionName: "bar",
+					Percent:      50,
+				},
+			}},
+		},
+		want: &apis.FieldError{
+			Message: `Multiple definitions for "foo"`,
+			Paths: []string{
+				"traffic[0].name",
+				"traffic[1].tag",
+			},
+		},
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.rs.Validate()
+			got := test.rs.Validate(context.Background())
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
@@ -269,38 +385,48 @@ func TestTrafficTargetValidation(t *testing.T) {
 	}{{
 		name: "valid with name and revision",
 		tt: &TrafficTarget{
-			Name:         "foo",
-			RevisionName: "bar",
-			Percent:      12,
+			DeprecatedName: "foo",
+			TrafficTarget: v1beta1.TrafficTarget{
+				RevisionName: "bar",
+				Percent:      12,
+			},
 		},
 		want: nil,
 	}, {
 		name: "valid with name and configuration",
 		tt: &TrafficTarget{
-			Name:              "baz",
-			ConfigurationName: "blah",
-			Percent:           37,
+			DeprecatedName: "baz",
+			TrafficTarget: v1beta1.TrafficTarget{
+				ConfigurationName: "blah",
+				Percent:           37,
+			},
 		},
 		want: nil,
 	}, {
 		name: "valid with no percent",
 		tt: &TrafficTarget{
-			Name:              "ooga",
-			ConfigurationName: "booga",
+			DeprecatedName: "ooga",
+			TrafficTarget: v1beta1.TrafficTarget{
+				ConfigurationName: "booga",
+			},
 		},
 		want: nil,
 	}, {
 		name: "valid with no name",
 		tt: &TrafficTarget{
-			ConfigurationName: "booga",
-			Percent:           100,
+			TrafficTarget: v1beta1.TrafficTarget{
+				ConfigurationName: "booga",
+				Percent:           100,
+			},
 		},
 		want: nil,
 	}, {
 		name: "invalid with both",
 		tt: &TrafficTarget{
-			RevisionName:      "foo",
-			ConfigurationName: "bar",
+			TrafficTarget: v1beta1.TrafficTarget{
+				RevisionName:      "foo",
+				ConfigurationName: "bar",
+			},
 		},
 		want: &apis.FieldError{
 			Message: "expected exactly one, got both",
@@ -309,8 +435,10 @@ func TestTrafficTargetValidation(t *testing.T) {
 	}, {
 		name: "invalid with neither",
 		tt: &TrafficTarget{
-			Name:    "foo",
-			Percent: 100,
+			DeprecatedName: "foo",
+			TrafficTarget: v1beta1.TrafficTarget{
+				Percent: 100,
+			},
 		},
 		want: &apis.FieldError{
 			Message: "expected exactly one, got neither",
@@ -319,22 +447,38 @@ func TestTrafficTargetValidation(t *testing.T) {
 	}, {
 		name: "invalid percent too low",
 		tt: &TrafficTarget{
-			RevisionName: "foo",
-			Percent:      -5,
+			TrafficTarget: v1beta1.TrafficTarget{
+				RevisionName: "foo",
+				Percent:      -5,
+			},
 		},
-		want: apis.ErrInvalidValue("-5", "percent"),
+		want: apis.ErrOutOfBoundsValue(-5, 0, 100, "percent"),
 	}, {
 		name: "invalid percent too high",
 		tt: &TrafficTarget{
-			RevisionName: "foo",
-			Percent:      101,
+			TrafficTarget: v1beta1.TrafficTarget{
+				RevisionName: "foo",
+				Percent:      101,
+			},
 		},
-		want: apis.ErrInvalidValue("101", "percent"),
+		want: apis.ErrOutOfBoundsValue(101, 0, 100, "percent"),
+	}, {
+		name: "disallowed url set",
+		tt: &TrafficTarget{
+			TrafficTarget: v1beta1.TrafficTarget{
+				ConfigurationName: "foo",
+				Percent:           100,
+				URL: &apis.URL{
+					Host: "should.not.be.set",
+				},
+			},
+		},
+		want: apis.ErrDisallowedFields("url"),
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.tt.Validate()
+			got := test.tt.Validate(context.Background())
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}

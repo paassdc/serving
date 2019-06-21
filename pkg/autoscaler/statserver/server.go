@@ -27,6 +27,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/knative/serving/pkg/autoscaler"
+	"github.com/knative/serving/pkg/network"
 	"go.uber.org/zap"
 )
 
@@ -90,21 +91,32 @@ func (s *Server) listen() (net.Listener, error) {
 
 func (s *Server) serve(l net.Listener) error {
 	close(s.servingCh)
-	err := s.wsSrv.Serve(l)
-	if err != http.ErrServerClosed {
+	if err := s.wsSrv.Serve(l); err != http.ErrServerClosed {
 		return err
 	}
 	return nil
+}
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) bool {
+	if network.IsKubeletProbe(r) {
+		// As an initial approach, once stats server is up -- return true.
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+	return false
 }
 
 // Handler exposes a websocket handler for receiving stats from queue
 // sidecar containers.
 func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 	s.logger.Debug("Handle entered")
+	if handleHealthz(w, r) {
+		return
+	}
 	var upgrader websocket.Upgrader
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		s.logger.Error("Error upgrading websocket.", zap.Error(err))
+		s.logger.Errorw("error upgrading websocket", zap.Error(err))
 		return
 	}
 
@@ -153,6 +165,8 @@ func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 			s.logger.Error(err)
 			continue
 		}
+		now := time.Now()
+		sm.Stat.Time = &now
 
 		s.logger.Debugf("Received stat message: %+v", sm)
 		s.statsCh <- &sm
@@ -163,7 +177,6 @@ func (s *Server) Handler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) Shutdown(timeout time.Duration) {
 	<-s.servingCh
 	s.logger.Info("Shutting down")
-	shutdownStart := time.Now()
 
 	close(s.stopCh)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -173,7 +186,7 @@ func (s *Server) Shutdown(timeout time.Duration) {
 		if err == context.DeadlineExceeded {
 			s.logger.Warn("Shutdown timed out")
 		} else {
-			s.logger.Error("Shutdown failed.", err)
+			s.logger.Errorw("Shutdown failed.", zap.Error(err))
 		}
 	}
 
@@ -187,8 +200,7 @@ func (s *Server) Shutdown(timeout time.Duration) {
 	select {
 	case <-done:
 		s.logger.Info("Shutdown complete")
-	case <-time.After(shutdownStart.Add(timeout).Sub(time.Now())):
+	case <-ctx.Done():
 		s.logger.Warn("Shutdown timed out")
 	}
-	close(s.statsCh)
 }

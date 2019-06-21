@@ -22,7 +22,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -36,47 +35,39 @@ const (
 type Config struct {
 	// Feature flags.
 	EnableScaleToZero bool
-	EnableVPA         bool
 
 	// Target concurrency knobs for different container concurrency configurations.
-	ContainerConcurrencyTargetPercentage float64
-	ContainerConcurrencyTargetDefault    float64
+	ContainerConcurrencyTargetFraction float64
+	ContainerConcurrencyTargetDefault  float64
 
 	// General autoscaler algorithm configuration.
-	MaxScaleUpRate float64
-	StableWindow   time.Duration
-	PanicWindow    time.Duration
-	TickInterval   time.Duration
+	MaxScaleUpRate           float64
+	StableWindow             time.Duration
+	PanicWindowPercentage    float64
+	PanicThresholdPercentage float64
+	// Deprecated in favor of PanicWindowPercentage.
+	PanicWindow  time.Duration
+	TickInterval time.Duration
 
 	ScaleToZeroGracePeriod time.Duration
-}
-
-// TargetConcurrency calculates the target concurrency for a given container-concurrency
-// taking the container-concurrency-target-percentage into account.
-func (c *Config) TargetConcurrency(concurrency v1alpha1.RevisionContainerConcurrencyType) float64 {
-	if concurrency == 0 {
-		return c.ContainerConcurrencyTargetDefault
-	}
-	return float64(concurrency) * c.ContainerConcurrencyTargetPercentage
 }
 
 // NewConfigFromMap creates a Config from the supplied map
 func NewConfigFromMap(data map[string]string) (*Config, error) {
 	lc := &Config{}
 
-	// Process bool fields
+	// Process bool fields.
 	for _, b := range []struct {
-		key   string
-		field *bool
+		key          string
+		field        *bool
+		defaultValue bool
 	}{{
-		key:   "enable-scale-to-zero",
-		field: &lc.EnableScaleToZero,
-	}, {
-		key:   "enable-vertical-pod-autoscaling",
-		field: &lc.EnableVPA,
+		key:          "enable-scale-to-zero",
+		field:        &lc.EnableScaleToZero,
+		defaultValue: true,
 	}} {
 		if raw, ok := data[b.key]; !ok {
-			*b.field = false
+			*b.field = b.defaultValue
 		} else {
 			*b.field = strings.ToLower(raw) == "true"
 		}
@@ -84,27 +75,35 @@ func NewConfigFromMap(data map[string]string) (*Config, error) {
 
 	// Process Float64 fields
 	for _, f64 := range []struct {
-		key      string
-		field    *float64
-		optional bool
+		key   string
+		field *float64
 		// specified exactly when optional
 		defaultValue float64
 	}{{
-		key:   "max-scale-up-rate",
-		field: &lc.MaxScaleUpRate,
+		key:          "max-scale-up-rate",
+		field:        &lc.MaxScaleUpRate,
+		defaultValue: 10.0,
 	}, {
 		key:   "container-concurrency-target-percentage",
-		field: &lc.ContainerConcurrencyTargetPercentage,
+		field: &lc.ContainerConcurrencyTargetFraction,
+		// TODO(#1956): Tune target usage based on empirical data.
+		// TODO(#2016): Revert to 0.7 once incorrect reporting is solved
+		defaultValue: 1.0,
 	}, {
-		key:   "container-concurrency-target-default",
-		field: &lc.ContainerConcurrencyTargetDefault,
+		key:          "container-concurrency-target-default",
+		field:        &lc.ContainerConcurrencyTargetDefault,
+		defaultValue: 100.0,
+	}, {
+		key:          "panic-window-percentage",
+		field:        &lc.PanicWindowPercentage,
+		defaultValue: 10.0,
+	}, {
+		key:          "panic-threshold-percentage",
+		field:        &lc.PanicThresholdPercentage,
+		defaultValue: 200.0,
 	}} {
 		if raw, ok := data[f64.key]; !ok {
-			if f64.optional {
-				*f64.field = f64.defaultValue
-				continue
-			}
-			return nil, fmt.Errorf("Autoscaling configmap is missing %q", f64.key)
+			*f64.field = f64.defaultValue
 		} else if val, err := strconv.ParseFloat(raw, 64); err != nil {
 			return nil, err
 		} else {
@@ -112,34 +111,42 @@ func NewConfigFromMap(data map[string]string) (*Config, error) {
 		}
 	}
 
+	if lc.ContainerConcurrencyTargetFraction <= 0 || lc.ContainerConcurrencyTargetFraction > 100 {
+		return nil, fmt.Errorf("container-concurrency-target-percentage = %f is outside of valid range of (0, 100]", lc.ContainerConcurrencyTargetFraction)
+	}
+
+	// Adjust % ⇒ fractions: for legacy reasons we allow values
+	// (0, 1] interval, so minimal percentage must be greater than 1.0.
+	// Internally we want to have fractions, since otherwise we'll have
+	// to perform division on each computation.
+	if lc.ContainerConcurrencyTargetFraction > 1.0 {
+		lc.ContainerConcurrencyTargetFraction /= 100.0
+	}
+
 	// Process Duration fields
 	for _, dur := range []struct {
-		key      string
-		field    *time.Duration
-		optional bool
-		// specified exactly when optional
+		key          string
+		field        *time.Duration
 		defaultValue time.Duration
 	}{{
-		key:   "stable-window",
-		field: &lc.StableWindow,
+		key:          "stable-window",
+		field:        &lc.StableWindow,
+		defaultValue: 60 * time.Second,
 	}, {
-		key:   "panic-window",
-		field: &lc.PanicWindow,
+		key:          "panic-window",
+		field:        &lc.PanicWindow,
+		defaultValue: 6 * time.Second,
 	}, {
 		key:          "scale-to-zero-grace-period",
 		field:        &lc.ScaleToZeroGracePeriod,
-		optional:     true,
 		defaultValue: 30 * time.Second,
 	}, {
-		key:   "tick-interval",
-		field: &lc.TickInterval,
+		key:          "tick-interval",
+		field:        &lc.TickInterval,
+		defaultValue: 2 * time.Second,
 	}} {
 		if raw, ok := data[dur.key]; !ok {
-			if dur.optional {
-				*dur.field = dur.defaultValue
-				continue
-			}
-			return nil, fmt.Errorf("Autoscaling configmap is missing %q", dur.key)
+			*dur.field = dur.defaultValue
 		} else if val, err := time.ParseDuration(raw); err != nil {
 			return nil, err
 		} else {

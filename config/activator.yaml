@@ -17,8 +17,9 @@ kind: Deployment
 metadata:
   name: activator
   namespace: knative-serving
+  labels:
+    serving.knative.dev/release: devel
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: activator
@@ -26,10 +27,12 @@ spec:
   template:
     metadata:
       annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
         sidecar.istio.io/inject: "true"
       labels:
         app: activator
         role: activator
+        serving.knative.dev/release: devel
     spec:
       serviceAccountName: controller
       containers:
@@ -38,8 +41,10 @@ spec:
         # and substituted here.
         image: github.com/knative/serving/cmd/activator
         ports:
-        - name: activator-port
-          containerPort: 8080
+        - name: http1-port
+          containerPort: 8012
+        - name: h2c-port
+          containerPort: 8013
         - name: metrics-port
           containerPort: 9090
         args:
@@ -47,6 +52,25 @@ spec:
           # and seeing k8s logs in addition to ours is not useful.
         - "-logtostderr=false"
         - "-stderrthreshold=FATAL"
+        readinessProbe:
+          httpGet:
+            # The path does not matter, we look for the kubelet user-agent
+            # (or our header below)
+            path: /healthz
+            port: 8012
+            httpHeaders:
+            # Istio with mTLS strips the Kubelet user-agent, so pass a header too.
+            - name: k-kubelet-probe
+              value: "activator"
+        livenessProbe:
+          httpGet:
+            # The path does not matter, we look for kubelet probe headers.
+            path: /healthz
+            port: 8012
+            httpHeaders:
+            # Istio with mTLS strips the Kubelet user-agent, so pass a header too.
+            - name: k-kubelet-probe
+              value: "activator"
         resources:
           # Request 2x what we saw running e2e
           requests:
@@ -61,6 +85,16 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.name
+          - name: SYSTEM_NAMESPACE
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.namespace
+          - name: CONFIG_LOGGING_NAME
+            value: config-logging
+          - name: CONFIG_OBSERVABILITY_NAME
+            value: config-observability
+          - name: METRICS_DOMAIN
+            value: knative.dev/serving
         volumeMounts:
         - name: config-logging
           mountPath: /etc/config-logging

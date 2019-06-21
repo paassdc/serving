@@ -17,51 +17,14 @@ limitations under the License.
 package autoscaler
 
 import (
-	"fmt"
-	"io/ioutil"
 	"testing"
 	"time"
 
-	"github.com/ghodss/yaml"
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
+	. "github.com/knative/pkg/configmap/testing"
 )
-
-func TestTargetConcurrency(t *testing.T) {
-	c := &Config{
-		ContainerConcurrencyTargetPercentage: 0.5,
-		ContainerConcurrencyTargetDefault:    10.0,
-	}
-
-	tests := []struct {
-		name                 string
-		containerConcurrency int
-		want                 float64
-	}{{
-		name:                 "default",
-		containerConcurrency: 0,
-		want:                 10.0,
-	}, {
-		name:                 "single",
-		containerConcurrency: 1,
-		want:                 0.5,
-	}, {
-		name:                 "multi",
-		containerConcurrency: 10,
-		want:                 5.0,
-	}}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := c.TargetConcurrency(v1alpha1.RevisionContainerConcurrencyType(test.containerConcurrency))
-			if got != test.want {
-				t.Errorf("TargetConcurrency() = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
 
 func TestNewConfig(t *testing.T) {
 	tests := []struct {
@@ -78,88 +41,124 @@ func TestNewConfig(t *testing.T) {
 			"stable-window":                           "5m",
 			"panic-window":                            "10s",
 			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
 		},
 		want: &Config{
-			ContainerConcurrencyTargetPercentage: 0.5,
-			ContainerConcurrencyTargetDefault:    10.0,
-			MaxScaleUpRate:                       1.0,
-			StableWindow:                         5 * time.Minute,
-			PanicWindow:                          10 * time.Second,
-			ScaleToZeroGracePeriod:               30 * time.Second,
-			TickInterval:                         2 * time.Second,
+			EnableScaleToZero:                  true,
+			ContainerConcurrencyTargetFraction: 0.5,
+			ContainerConcurrencyTargetDefault:  10.0,
+			MaxScaleUpRate:                     1.0,
+			StableWindow:                       5 * time.Minute,
+			PanicWindow:                        10 * time.Second,
+			ScaleToZeroGracePeriod:             30 * time.Second,
+			TickInterval:                       2 * time.Second,
+			PanicWindowPercentage:              10.0,
+			PanicThresholdPercentage:           200.0,
+		},
+	}, {
+		name: "concurrencty target percentage as percent",
+		input: map[string]string{
+			"enable-scale-to-zero":                    "true",
+			"max-scale-up-rate":                       "1.0",
+			"container-concurrency-target-percentage": "50",
+			"container-concurrency-target-default":    "10.0",
+			"stable-window":                           "5m",
+			"panic-window":                            "10s",
+			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
+		},
+		want: &Config{
+			EnableScaleToZero:                  true,
+			ContainerConcurrencyTargetFraction: 0.5,
+			ContainerConcurrencyTargetDefault:  10.0,
+			MaxScaleUpRate:                     1.0,
+			StableWindow:                       5 * time.Minute,
+			PanicWindow:                        10 * time.Second,
+			ScaleToZeroGracePeriod:             30 * time.Second,
+			TickInterval:                       2 * time.Second,
+			PanicWindowPercentage:              10.0,
+			PanicThresholdPercentage:           200.0,
 		},
 	}, {
 		name: "with toggles on",
 		input: map[string]string{
 			"enable-scale-to-zero":                    "true",
-			"enable-vertical-pod-autoscaling":         "true",
 			"max-scale-up-rate":                       "1.0",
 			"container-concurrency-target-percentage": "0.5",
 			"container-concurrency-target-default":    "10.0",
 			"stable-window":                           "5m",
 			"panic-window":                            "10s",
 			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
 		},
 		want: &Config{
-			EnableScaleToZero:                    true,
-			EnableVPA:                            true,
-			ContainerConcurrencyTargetPercentage: 0.5,
-			ContainerConcurrencyTargetDefault:    10.0,
-			MaxScaleUpRate:                       1.0,
-			StableWindow:                         5 * time.Minute,
-			PanicWindow:                          10 * time.Second,
-			ScaleToZeroGracePeriod:               30 * time.Second,
-			TickInterval:                         2 * time.Second,
+			EnableScaleToZero:                  true,
+			ContainerConcurrencyTargetFraction: 0.5,
+			ContainerConcurrencyTargetDefault:  10.0,
+			MaxScaleUpRate:                     1.0,
+			StableWindow:                       5 * time.Minute,
+			PanicWindow:                        10 * time.Second,
+			ScaleToZeroGracePeriod:             30 * time.Second,
+			TickInterval:                       2 * time.Second,
+			PanicWindowPercentage:              10.0,
+			PanicThresholdPercentage:           200.0,
 		},
 	}, {
 		name: "with toggles on strange casing",
 		input: map[string]string{
 			"enable-scale-to-zero":                    "TRUE",
-			"enable-vertical-pod-autoscaling":         "True",
 			"max-scale-up-rate":                       "1.0",
 			"container-concurrency-target-percentage": "0.5",
 			"container-concurrency-target-default":    "10.0",
 			"stable-window":                           "5m",
 			"panic-window":                            "10s",
 			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
 		},
 		want: &Config{
-			EnableScaleToZero:                    true,
-			EnableVPA:                            true,
-			ContainerConcurrencyTargetPercentage: 0.5,
-			ContainerConcurrencyTargetDefault:    10.0,
-			MaxScaleUpRate:                       1.0,
-			StableWindow:                         5 * time.Minute,
-			PanicWindow:                          10 * time.Second,
-			ScaleToZeroGracePeriod:               30 * time.Second,
-			TickInterval:                         2 * time.Second,
+			EnableScaleToZero:                  true,
+			ContainerConcurrencyTargetFraction: 0.5,
+			ContainerConcurrencyTargetDefault:  10.0,
+			MaxScaleUpRate:                     1.0,
+			StableWindow:                       5 * time.Minute,
+			PanicWindow:                        10 * time.Second,
+			ScaleToZeroGracePeriod:             30 * time.Second,
+			TickInterval:                       2 * time.Second,
+			PanicWindowPercentage:              10.0,
+			PanicThresholdPercentage:           200.0,
 		},
 	}, {
 		name: "with toggles explicitly off",
 		input: map[string]string{
 			"enable-scale-to-zero":                    "false",
-			"enable-vertical-pod-autoscaling":         "False",
 			"max-scale-up-rate":                       "1.0",
 			"container-concurrency-target-percentage": "0.5",
 			"container-concurrency-target-default":    "10.0",
 			"stable-window":                           "5m",
 			"panic-window":                            "10s",
 			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
 		},
 		want: &Config{
-			ContainerConcurrencyTargetPercentage: 0.5,
-			ContainerConcurrencyTargetDefault:    10.0,
-			MaxScaleUpRate:                       1.0,
-			StableWindow:                         5 * time.Minute,
-			PanicWindow:                          10 * time.Second,
-			ScaleToZeroGracePeriod:               30 * time.Second,
-			TickInterval:                         2 * time.Second,
+			ContainerConcurrencyTargetFraction: 0.5,
+			ContainerConcurrencyTargetDefault:  10.0,
+			MaxScaleUpRate:                     1.0,
+			StableWindow:                       5 * time.Minute,
+			PanicWindow:                        10 * time.Second,
+			ScaleToZeroGracePeriod:             30 * time.Second,
+			TickInterval:                       2 * time.Second,
+			PanicWindowPercentage:              10.0,
+			PanicThresholdPercentage:           200.0,
 		},
 	}, {
 		name: "with explicit grace period",
 		input: map[string]string{
 			"enable-scale-to-zero":                    "false",
-			"enable-vertical-pod-autoscaling":         "False",
 			"max-scale-up-rate":                       "1.0",
 			"container-concurrency-target-percentage": "0.5",
 			"container-concurrency-target-default":    "10.0",
@@ -167,36 +166,20 @@ func TestNewConfig(t *testing.T) {
 			"panic-window":                            "10s",
 			"scale-to-zero-grace-period":              "30s",
 			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
 		},
 		want: &Config{
-			ContainerConcurrencyTargetPercentage: 0.5,
-			ContainerConcurrencyTargetDefault:    10.0,
-			MaxScaleUpRate:                       1.0,
-			StableWindow:                         5 * time.Minute,
-			PanicWindow:                          10 * time.Second,
-			ScaleToZeroGracePeriod:               30 * time.Second,
-			TickInterval:                         2 * time.Second,
+			ContainerConcurrencyTargetFraction: 0.5,
+			ContainerConcurrencyTargetDefault:  10.0,
+			MaxScaleUpRate:                     1.0,
+			StableWindow:                       5 * time.Minute,
+			PanicWindow:                        10 * time.Second,
+			ScaleToZeroGracePeriod:             30 * time.Second,
+			TickInterval:                       2 * time.Second,
+			PanicWindowPercentage:              10.0,
+			PanicThresholdPercentage:           200.0,
 		},
-	}, {
-		name: "missing required float field",
-		input: map[string]string{
-			"container-concurrency-target-percentage": "0.5",
-			"container-concurrency-target-default":    "10.0",
-			"stable-window":                           "5m",
-			"panic-window":                            "10s",
-			"tick-interval":                           "2s",
-		},
-		wantErr: true,
-	}, {
-		name: "missing required duration field",
-		input: map[string]string{
-			"max-scale-up-rate":                       "1.0",
-			"container-concurrency-target-percentage": "0.5",
-			"container-concurrency-target-default":    "10.0",
-			"stable-window":                           "5m",
-			"tick-interval":                           "2s",
-		},
-		wantErr: true,
 	}, {
 		name: "malformed float",
 		input: map[string]string{
@@ -206,6 +189,8 @@ func TestNewConfig(t *testing.T) {
 			"stable-window":                           "5m",
 			"panic-window":                            "10s",
 			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
 		},
 		wantErr: true,
 	}, {
@@ -217,6 +202,34 @@ func TestNewConfig(t *testing.T) {
 			"stable-window":                           "not a duration",
 			"panic-window":                            "10s",
 			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
+		},
+		wantErr: true,
+	}, {
+		name: "invalid target %",
+		input: map[string]string{
+			"max-scale-up-rate":                       "1.0",
+			"container-concurrency-target-percentage": "-42",
+			"container-concurrency-target-default":    "10.0",
+			"stable-window":                           "not a duration",
+			"panic-window":                            "10s",
+			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
+		},
+		wantErr: true,
+	}, {
+		name: "invalid target %",
+		input: map[string]string{
+			"max-scale-up-rate":                       "1.0",
+			"container-concurrency-target-percentage": "142.4",
+			"container-concurrency-target-default":    "10.0",
+			"stable-window":                           "not a duration",
+			"panic-window":                            "10s",
+			"tick-interval":                           "2s",
+			"panic-window-percentage":                 "10",
+			"panic-threshold-percentage":              "200",
 		},
 		wantErr: true,
 	}}
@@ -237,15 +250,11 @@ func TestNewConfig(t *testing.T) {
 }
 
 func TestOurConfig(t *testing.T) {
-	b, err := ioutil.ReadFile(fmt.Sprintf("testdata/%s.yaml", ConfigName))
-	if err != nil {
-		t.Errorf("ReadFile() = %v", err)
+	cm, example := ConfigMapsFromTestFile(t, ConfigName)
+	if _, err := NewConfigFromConfigMap(cm); err != nil {
+		t.Errorf("NewConfigFromConfigMap(actual) = %v", err)
 	}
-	var cm corev1.ConfigMap
-	if err := yaml.Unmarshal(b, &cm); err != nil {
-		t.Errorf("yaml.Unmarshal() = %v", err)
-	}
-	if _, err := NewConfigFromConfigMap(&cm); err != nil {
-		t.Errorf("NewConfigFromConfigMap() = %v", err)
+	if _, err := NewConfigFromConfigMap(example); err != nil {
+		t.Errorf("NewConfigFromConfigMap(example) = %v", err)
 	}
 }

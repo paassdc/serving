@@ -21,8 +21,6 @@ package test
 
 import (
 	"flag"
-	"os"
-	"path"
 
 	"github.com/knative/pkg/test"
 	"github.com/knative/pkg/test/logging"
@@ -31,6 +29,24 @@ import (
 const (
 	// ServingNamespace is the default namespace for serving e2e tests
 	ServingNamespace = "serving-tests"
+
+	// AlternativeServingNamespace is a different namepace to run cross-
+	// namespace tests in.
+	AlternativeServingNamespace = "serving-tests-alt"
+
+	// E2EMetricExporter is the name for the metrics exporter logger
+	E2EMetricExporter = "e2e-metrics"
+
+	// Environment propagation conformance test objects
+
+	// ConformanceConfigMap is the name of the configmap to propagate env variables from
+	ConformanceConfigMap = "conformance-test-configmap"
+	// ConformanceSecret is the name of the secret to propagate env variables from
+	ConformanceSecret = "conformance-test-secret"
+	// EnvKey is the configmap/secret key which contains test value
+	EnvKey = "testKey"
+	// EnvValue is the configmap/secret test value to match env variable with
+	EnvValue = "testValue"
 )
 
 // ServingFlags holds the flags or defaults for knative/serving settings in the user's environment.
@@ -38,9 +54,7 @@ var ServingFlags = initializeServingFlags()
 
 // ServingEnvironmentFlags holds the e2e flags needed only by the serving repo.
 type ServingEnvironmentFlags struct {
-	ResolvableDomain bool   // Resolve Route controller's `domainSuffix`
-	DockerRepo       string // Docker repo (defaults to $DOCKER_REPO_OVERRIDE)
-	Tag              string // Test images version tag
+	ResolvableDomain bool // Resolve Route controller's `domainSuffix`
 }
 
 func initializeServingFlags() *ServingEnvironmentFlags {
@@ -49,19 +63,12 @@ func initializeServingFlags() *ServingEnvironmentFlags {
 	flag.BoolVar(&f.ResolvableDomain, "resolvabledomain", false,
 		"Set this flag to true if you have configured the `domainSuffix` on your Route controller to a domain that will resolve to your test cluster.")
 
-	defaultRepo := path.Join(os.Getenv("DOCKER_REPO_OVERRIDE"), "github.com/knative/serving/test/test_images")
-	flag.StringVar(&f.DockerRepo, "dockerrepo", defaultRepo,
-		"Provide the uri of the docker repo you have uploaded the test image to using `uploadtestimage.sh`. Defaults to $DOCKER_REPO_OVERRIDE")
-
-	flag.StringVar(&f.Tag, "tag", "latest",
-		"Provide the version tag for the test images.")
-
 	flag.Parse()
 	flag.Set("alsologtostderr", "true")
 	logging.InitializeLogger(test.Flags.LogVerbose)
 
 	if test.Flags.EmitMetrics {
-		logging.InitializeMetricExporter()
+		logging.InitializeMetricExporter(E2EMetricExporter)
 	}
 
 	return &f

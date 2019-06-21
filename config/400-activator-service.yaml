@@ -19,6 +19,7 @@ metadata:
   namespace: knative-serving
   labels:
     app: activator
+    serving.knative.dev/release: devel
 spec:
   selector:
     app: activator
@@ -26,9 +27,13 @@ spec:
   - name: http
     protocol: TCP
     port: 80
-    targetPort: 8080
+    targetPort: 8012
+  - name: http2
+    protocol: TCP
+    port: 81
+    targetPort: 8013
   - name: metrics
     protocol: TCP
     port: 9090
     targetPort: 9090
-  type: NodePort
+  type: ClusterIP

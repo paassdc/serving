@@ -16,62 +16,17 @@
 
 source $(dirname $0)/../vendor/github.com/knative/test-infra/scripts/release.sh
 
-# Set default GCS/GCR
-: ${SERVING_RELEASE_GCS:="knative-nightly/serving"}
-: ${SERVING_RELEASE_GCR:="gcr.io/knative-nightly"}
-readonly SERVING_RELEASE_GCS
-readonly SERVING_RELEASE_GCR
+function build_release() {
+  # Run `generate-yamls.sh`, which should be versioned with the
+  # branch since the detail of building may change over time.
+  local YAML_LIST="$(mktemp)"
+  export TAG
+  $(dirname $0)/generate-yamls.sh "${REPO_ROOT_DIR}" "${YAML_LIST}"
+  YAMLS_TO_PUBLISH=$(cat "${YAML_LIST}" | tr '\n' ' ')
+  if (( ! PUBLISH_RELEASE )); then
+    # Copy the generated YAML files to the repo root dir if not publishing.
+    cp ${YAMLS_TO_PUBLISH} ${REPO_ROOT_DIR}
+  fi
+}
 
-# Set the repository
-export KO_DOCKER_REPO="${SERVING_RELEASE_GCR}"
-
-# Script entry point
-
-initialize $@
-
-set -o errexit
-set -o pipefail
-
-run_validation_tests ./test/presubmit-tests.sh
-
-banner "Building the release"
-
-# Build should not try to deploy anything, use a bogus value for cluster.
-export K8S_CLUSTER_OVERRIDE=CLUSTER_NOT_SET
-export K8S_USER_OVERRIDE=USER_NOT_SET
-export DOCKER_REPO_OVERRIDE=DOCKER_NOT_SET
-
-echo "- Destination GCR: ${KO_DOCKER_REPO}"
-if (( PUBLISH_RELEASE )); then
-  echo "- Destination GCS: ${SERVING_RELEASE_GCS}"
-fi
-
-# Build the release
-
-# Run `generate-yamls.sh`, which should be versioned with the
-# branch since the detail of building may change over time.
-readonly YAML_LIST="$(mktemp)"
-$(dirname $0)/generate-yamls.sh "${REPO_ROOT_DIR}" "${YAML_LIST}"
-readonly YAMLS_TO_PUBLISH=$(cat "${YAML_LIST}" | tr '\n' ' ')
-readonly RELEASE_YAML="$(head -n1 ${YAML_LIST})"
-
-tag_images_in_yaml "${RELEASE_YAML}" "${KO_DOCKER_REPO}" "${TAG}"
-
-echo "New release built successfully"
-
-if (( ! PUBLISH_RELEASE )); then
-  # Copy the generated YAML files to the repo root dir.
-  cp ${YAMLS_TO_PUBLISH} ${REPO_ROOT_DIR}
-  exit 0
-fi
-
-# Publish the release
-# We publish our own istio.yaml, so users don't need to use helm
-for yaml in ${YAMLS_TO_PUBLISH}; do
-  echo "Publishing ${yaml}"
-  publish_yaml "${yaml}" "${SERVING_RELEASE_GCS}" "${TAG}"
-done
-
-branch_release "Knative Serving" "${YAMLS_TO_PUBLISH}"
-
-echo "New release published successfully"
+main $@

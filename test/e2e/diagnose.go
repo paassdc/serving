@@ -1,88 +1,104 @@
 package e2e
 
 import (
-	"fmt"
+	"sync"
+	"testing"
 	"time"
 
-	"github.com/knative/pkg/test/logging"
+	rnames "github.com/knative/serving/pkg/reconciler/revision/resources/names"
 	"github.com/knative/serving/test"
 
+	v1types "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func DiagnoseMeEvery(duration time.Duration, clients *test.Clients, logger *logging.BaseLogger) chan struct{} {
-	stopChan := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-stopChan:
-				return
-			default:
-			}
-			DiagnoseMe(clients, logger)
-			time.Sleep(duration)
-		}
-	}()
-	return stopChan
+type stateChecker struct {
+	stopChan chan struct{}
+	ticker   *time.Ticker
+	wg       *sync.WaitGroup
 }
 
-func DiagnoseMe(clients *test.Clients, logger *logging.BaseLogger) {
+// startDiagnosis creates and starts the periodic checker that checks and logs
+// k8s pod stats every duration period.
+// use stateChecker.stop() to stop the checker before test exit to avoid panics in the logs.
+func startDiagnosis(t *testing.T, clients *test.Clients, duration time.Duration) *stateChecker {
+	st := &stateChecker{
+		stopChan: make(chan struct{}),
+		ticker:   time.NewTicker(duration),
+		wg:       &sync.WaitGroup{},
+	}
+	st.wg.Add(1)
+	go func() {
+		defer st.wg.Done()
+		for {
+			select {
+			case <-st.ticker.C:
+				diagnoseMe(t, clients)
+			case <-st.stopChan:
+				st.ticker.Stop()
+				t.Log("Stopping diagnose-me checker.")
+				return
+			}
+		}
+	}()
+	return st
+}
+
+func (sc *stateChecker) stop() {
+	close(sc.stopChan)
+	sc.wg.Wait()
+}
+
+func diagnoseMe(t *testing.T, clients *test.Clients) {
 	if clients == nil || clients.KubeClient == nil || clients.KubeClient.Kube == nil {
-		logger.Errorf(fmt.Sprintf("could not diagnose: nil kube client"))
+		t.Log("Could not diagnose: nil kube client")
 		return
 	}
 
-	for _, check := range []func(*test.Clients, *logging.BaseLogger){
+	for _, check := range []func(*testing.T, *test.Clients){
 		checkCurrentPodCount,
 		checkUnschedulablePods,
 	} {
-		check(clients, logger)
+		check(t, clients)
 	}
 }
 
-func checkCurrentPodCount(clients *test.Clients, logger *logging.BaseLogger) {
-	revs, err := clients.ServingClient.Revisions.List(metav1.ListOptions{})
+func checkCurrentPodCount(t *testing.T, clients *test.Clients) {
+	revs, err := clients.ServingAlphaClient.Revisions.List(metav1.ListOptions{})
 	if err != nil {
-		logger.Errorf(fmt.Sprintf("could not check current pod count: %v", err))
+		t.Logf("%v: could not check current pod count: %v", time.Now(), err)
 		return
 	}
 	for _, r := range revs.Items {
-		deploymentName := r.Name + "-deployment"
+		deploymentName := rnames.Deployment(&r)
 		dep, err := clients.KubeClient.Kube.AppsV1().Deployments(test.ServingNamespace).Get(deploymentName, metav1.GetOptions{})
 		if err != nil {
-			logger.Errorf(fmt.Sprintf("could not get deployment %v", deploymentName))
+			t.Logf("Could not get deployment %s", deploymentName)
 			continue
 		}
-		want := dep.Status.Replicas
-		have := dep.Status.ReadyReplicas
-		if have != want {
-			logger.Infof("deployment %v has %v pods. wants %v.", deploymentName, have, want)
-		} else {
-			logger.Infof("deployment %v has %v pods.", deploymentName, have)
-		}
+		t.Logf("%v: deployment %s has %d pods, want: %d.", time.Now(), deploymentName, dep.Status.Replicas, dep.Status.ReadyReplicas)
 	}
 }
 
-func checkUnschedulablePods(clients *test.Clients, logger *logging.BaseLogger) {
+func checkUnschedulablePods(t *testing.T, clients *test.Clients) {
 	kube := clients.KubeClient.Kube
 	pods, err := kube.CoreV1().Pods(test.ServingNamespace).List(metav1.ListOptions{})
 	if err != nil {
-		logger.Errorf(fmt.Sprintf("could not check unschedulable pods: %v", err))
+		t.Logf("%v: could not check unschedulable pods: %v", time.Now(), err)
 		return
 	}
-	totalPods := 0
+
+	totalPods := len(pods.Items)
 	unschedulablePods := 0
 	for _, p := range pods.Items {
-		totalPods++
 		for _, c := range p.Status.Conditions {
-			if c.Type == "PodScheduled" && c.Status == "False" && c.Reason == "Unschedulable" {
+			if c.Type == v1types.PodScheduled && c.Status == v1types.ConditionFalse && c.Reason == v1types.PodReasonUnschedulable {
 				unschedulablePods++
 				break
 			}
 		}
 	}
 	if unschedulablePods != 0 {
-		logger.Errorf(fmt.Sprintf("%v out of %v pods are unschedulable. insufficient cluster capacity?",
-			unschedulablePods, totalPods))
+		t.Logf("%v: %d out of %d pods are unschedulable. Insufficient cluster capacity?", time.Now(), unschedulablePods, totalPods)
 	}
 }

@@ -19,20 +19,20 @@ package statserver_test
 import (
 	"bytes"
 	"encoding/gob"
+	"fmt"
+	"net/http"
 	"net/url"
 	"runtime"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/gorilla/websocket"
 	"github.com/knative/serving/pkg/autoscaler"
 	stats "github.com/knative/serving/pkg/autoscaler/statserver"
-	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
-
-const testAddress = "127.0.0.1:0"
 
 func TestServerLifecycle(t *testing.T) {
 	statsCh := make(chan *autoscaler.StatMessage)
@@ -47,7 +47,29 @@ func TestServerLifecycle(t *testing.T) {
 	server.Shutdown(time.Second)
 
 	if err := eg.Wait(); err != nil {
-		t.Fatal("ListenAndServe failed.", err)
+		t.Error("ListenAndServe failed.", err)
+	}
+}
+
+func TestProbe(t *testing.T) {
+	statsCh := make(chan *autoscaler.StatMessage)
+	server := stats.NewTestServer(statsCh)
+
+	defer server.Shutdown(0)
+	go server.ListenAndServe()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/healthz", server.ListenAddr()), nil)
+	if err != nil {
+		t.Fatal("Error creating request:", err)
+	}
+	req.Header.Set("User-Agent", "kube-probe/1.15.i.wish")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal("Error roundtripping:", err)
+	}
+	defer resp.Body.Close()
+	if got, want := resp.StatusCode, http.StatusOK; got != want {
+		t.Errorf("StatusCode: %v, want: %v", got, want)
 	}
 }
 
@@ -60,8 +82,8 @@ func TestStatsReceived(t *testing.T) {
 
 	statSink := dialOk(server.ListenAddr(), t)
 
-	assertReceivedOk(newStatMessage("test-namespace/test-revision", "pod1", 2.1, 51), statSink, statsCh, t)
-	assertReceivedOk(newStatMessage("test-namespace/test-revision2", "pod2", 2.2, 30), statSink, statsCh, t)
+	assertReceivedOk(newStatMessage("test-namespace/test-revision", "activator1", 2.1, 51), statSink, statsCh, t)
+	assertReceivedOk(newStatMessage("test-namespace/test-revision2", "activator2", 2.2, 30), statSink, statsCh, t)
 
 	closeSink(statSink, t)
 }
@@ -75,12 +97,14 @@ func TestServerShutdown(t *testing.T) {
 	listenAddr := server.ListenAddr()
 	statSink := dialOk(listenAddr, t)
 
-	assertReceivedOk(newStatMessage("test-namespace/test-revision", "pod1", 2.1, 51), statSink, statsCh, t)
+	assertReceivedOk(newStatMessage("test-namespace/test-revision", "activator1", 2.1, 51), statSink, statsCh, t)
 
 	server.Shutdown(time.Second)
+	// We own the channel.
+	close(statsCh)
 
 	// Send a statistic to the server
-	send(statSink, newStatMessage("test-namespace/test-revision2", "pod2", 2.2, 30), t)
+	send(statSink, newStatMessage("test-namespace/test-revision2", "activator2", 2.2, 30), t)
 
 	// Check the statistic was not received
 	_, ok := <-statsCh
@@ -120,7 +144,7 @@ func TestServerDoesNotLeakGoroutines(t *testing.T) {
 	listenAddr := server.ListenAddr()
 	statSink := dialOk(listenAddr, t)
 
-	assertReceivedOk(newStatMessage("test-namespace/test-revision", "pod1", 2.1, 51), statSink, statsCh, t)
+	assertReceivedOk(newStatMessage("test-namespace/test-revision", "activator1", 2.1, 51), statSink, statsCh, t)
 
 	closeSink(statSink, t)
 
@@ -139,12 +163,10 @@ func TestServerDoesNotLeakGoroutines(t *testing.T) {
 	server.Shutdown(time.Second)
 }
 
-func newStatMessage(revKey string, podName string, averageConcurrentRequests float64, requestCount int32) *autoscaler.StatMessage {
-	now := time.Now()
+func newStatMessage(revKey string, podName string, averageConcurrentRequests float64, requestCount float64) *autoscaler.StatMessage {
 	return &autoscaler.StatMessage{
-		revKey,
-		autoscaler.Stat{
-			Time:                      &now,
+		Key: revKey,
+		Stat: autoscaler.Stat{
 			PodName:                   podName,
 			AverageConcurrentRequests: averageConcurrentRequests,
 			RequestCount:              requestCount,
@@ -158,8 +180,12 @@ func assertReceivedOk(sm *autoscaler.StatMessage, statSink *websocket.Conn, stat
 	if !ok {
 		t.Fatalf("statistic not received")
 	}
-	if !cmp.Equal(sm, recv) {
-		t.Fatalf("Expected and actual stats messages are not equal: %s", cmp.Diff(sm, recv))
+	if recv.Stat.Time == nil {
+		t.Fatalf("Stat time is nil")
+	}
+	ignoreTimeField := cmpopts.IgnoreFields(autoscaler.StatMessage{}, "Stat.Time")
+	if !cmp.Equal(sm, recv, ignoreTimeField) {
+		t.Fatalf("StatMessage mismatch: diff (-got, +want) %s", cmp.Diff(recv, sm, ignoreTimeField))
 	}
 	return true
 }
@@ -167,7 +193,7 @@ func assertReceivedOk(sm *autoscaler.StatMessage, statSink *websocket.Conn, stat
 func dialOk(serverURL string, t *testing.T) *websocket.Conn {
 	statSink, err := dial(serverURL, t)
 	if err != nil {
-		t.Fatalf("Dial failed: %v", zap.Error(err))
+		t.Fatal("Dial failed:", err)
 	}
 	return statSink
 }
@@ -189,13 +215,12 @@ func dial(serverURL string, t *testing.T) (*websocket.Conn, error) {
 func send(statSink *websocket.Conn, sm *autoscaler.StatMessage, t *testing.T) {
 	var b bytes.Buffer
 	enc := gob.NewEncoder(&b)
-	err := enc.Encode(sm)
-	if err != nil {
-		t.Fatal("Failed to encode data from stats channel", zap.Error(err))
+
+	if err := enc.Encode(sm); err != nil {
+		t.Fatal("Failed to encode data from stats channel:", err)
 	}
-	err = statSink.WriteMessage(websocket.BinaryMessage, b.Bytes())
-	if err != nil {
-		t.Fatal("Failed to write to stat sink.", zap.Error(err))
+	if err := statSink.WriteMessage(websocket.BinaryMessage, b.Bytes()); err != nil {
+		t.Fatal("Failed to write to stat sink:", err)
 	}
 }
 

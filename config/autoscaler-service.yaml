@@ -17,11 +17,12 @@ kind: Service
 metadata:
   labels:
     app: autoscaler
+    serving.knative.dev/release: devel
   name: autoscaler
   namespace: knative-serving
 spec:
   ports:
-  - name: websocket
+  - name: http
     port: 8080
     protocol: TCP
     targetPort: 8080
@@ -29,5 +30,9 @@ spec:
     port: 9090
     protocol: TCP
     targetPort: 9090
+  - name: custom-metrics
+    port: 443
+    protocol: TCP
+    targetPort: 8443
   selector:
     app: autoscaler

@@ -1,9 +1,12 @@
 /*
-Copyright 2018 Google Inc. All Rights Reserved.
+Copyright 2018 The Knative Authors
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
+
     http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -19,39 +22,29 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/knative/pkg/metrics"
 	"github.com/knative/pkg/metrics/metricskey"
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
 )
 
-// Measurement represents the type of the autoscaler metric to be reported
-type Measurement int
-
-const (
-	//RequestCountM is the request count when Activator proxy the request
-	RequestCountM = iota
-
-	// ResponseTimeInMsecM is the response time in millisecond
-	ResponseTimeInMsecM
-)
-
 var (
-	measurements = []*stats.Float64Measure{
-		RequestCountM: stats.Float64(
-			"request_count",
-			"The number of requests that are routed to Activator",
-			stats.UnitNone),
-		ResponseTimeInMsecM: stats.Float64(
-			"request_latencies",
-			"The response time in millisecond",
-			stats.UnitNone),
-	}
+	requestCountM = stats.Int64(
+		"request_count",
+		"The number of requests that are routed to Activator",
+		stats.UnitDimensionless)
+	responseTimeInMsecM = stats.Float64(
+		"request_latencies",
+		"The response time in millisecond",
+		stats.UnitMilliseconds)
+
+	defaultLatencyDistribution = view.Distribution(0, 5, 10, 20, 40, 60, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000, 2000, 5000, 10000, 20000, 50000, 100000)
 )
 
 // StatsReporter defines the interface for sending activator metrics
 type StatsReporter interface {
-	ReportRequestCount(ns, service, config, rev string, responseCode, numTries int, v float64) error
+	ReportRequestCount(ns, service, config, rev string, responseCode, numTries int, v int64) error
 	ReportResponseTime(ns, service, config, rev string, responseCode int, d time.Duration) error
 }
 
@@ -69,7 +62,6 @@ type Reporter struct {
 
 // NewStatsReporter creates a reporter that collects and reports activator metrics
 func NewStatsReporter() (*Reporter, error) {
-
 	var r = &Reporter{}
 
 	// Create the tag keys that will be used to add tags to our measurements.
@@ -112,14 +104,14 @@ func NewStatsReporter() (*Reporter, error) {
 	err = view.Register(
 		&view.View{
 			Description: "The number of requests that are routed to Activator",
-			Measure:     measurements[RequestCountM],
+			Measure:     requestCountM,
 			Aggregation: view.Sum(),
 			TagKeys:     []tag.Key{r.namespaceTagKey, r.serviceTagKey, r.configTagKey, r.revisionTagKey, r.responseCodeKey, r.responseCodeClassKey, r.numTriesKey},
 		},
 		&view.View{
 			Description: "The response time in millisecond",
-			Measure:     measurements[ResponseTimeInMsecM],
-			Aggregation: view.Distribution(1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000),
+			Measure:     responseTimeInMsecM,
+			Aggregation: defaultLatencyDistribution,
 			TagKeys:     []tag.Key{r.namespaceTagKey, r.serviceTagKey, r.configTagKey, r.revisionTagKey, r.responseCodeClassKey, r.responseCodeKey},
 		},
 	)
@@ -131,26 +123,34 @@ func NewStatsReporter() (*Reporter, error) {
 	return r, nil
 }
 
+func valueOrUnknown(v string) string {
+	if v != "" {
+		return v
+	}
+	return metricskey.ValueUnknown
+}
+
 // ReportRequestCount captures request count metric with value v.
-func (r *Reporter) ReportRequestCount(ns, service, config, rev string, responseCode, numTries int, v float64) error {
+func (r *Reporter) ReportRequestCount(ns, service, config, rev string, responseCode, numTries int, v int64) error {
 	if !r.initialized {
 		return errors.New("StatsReporter is not initialized yet")
 	}
 
+	// Note that service names can be an empty string, so it needs a special treatment.
 	ctx, err := tag.New(
 		context.Background(),
 		tag.Insert(r.namespaceTagKey, ns),
-		tag.Insert(r.serviceTagKey, service),
+		tag.Insert(r.serviceTagKey, valueOrUnknown(service)),
 		tag.Insert(r.configTagKey, config),
 		tag.Insert(r.revisionTagKey, rev),
 		tag.Insert(r.responseCodeKey, strconv.Itoa(responseCode)),
-		tag.Insert(r.responseCodeClassKey, getResponseCodeClass(responseCode)),
+		tag.Insert(r.responseCodeClassKey, responseCodeClass(responseCode)),
 		tag.Insert(r.numTriesKey, strconv.Itoa(numTries)))
 	if err != nil {
 		return err
 	}
 
-	stats.Record(ctx, measurements[RequestCountM].M(v))
+	metrics.Record(ctx, requestCountM.M(v))
 	return nil
 }
 
@@ -160,26 +160,27 @@ func (r *Reporter) ReportResponseTime(ns, service, config, rev string, responseC
 		return errors.New("StatsReporter is not initialized yet")
 	}
 
+	// Note that service names can be an empty string, so it needs a special treatment.
 	ctx, err := tag.New(
 		context.Background(),
 		tag.Insert(r.namespaceTagKey, ns),
-		tag.Insert(r.serviceTagKey, service),
+		tag.Insert(r.serviceTagKey, valueOrUnknown(service)),
 		tag.Insert(r.configTagKey, config),
 		tag.Insert(r.revisionTagKey, rev),
 		tag.Insert(r.responseCodeKey, strconv.Itoa(responseCode)),
-		tag.Insert(r.responseCodeClassKey, getResponseCodeClass(responseCode)))
+		tag.Insert(r.responseCodeClassKey, responseCodeClass(responseCode)))
 	if err != nil {
 		return err
 	}
 
 	// convert time.Duration in nanoseconds to milliseconds
-	stats.Record(ctx, measurements[ResponseTimeInMsecM].M(float64(d/time.Millisecond)))
+	metrics.Record(ctx, responseTimeInMsecM.M(float64(d/time.Millisecond)))
 	return nil
 }
 
-// getResponseCodeClass converts response code to a string of response code class.
+// responseCodeClass converts response code to a string of response code class.
 // e.g. The response code class is "5xx" for response code 503.
-func getResponseCodeClass(responseCode int) string {
-	// Get the hundred digit of the response code and concatenate "xx"
-	return strconv.Itoa((responseCode/100)%10) + "xx"
+func responseCodeClass(responseCode int) string {
+	// Get the hundred digit of the response code and concatenate "xx".
+	return strconv.Itoa(responseCode/100) + "xx"
 }

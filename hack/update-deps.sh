@@ -14,24 +14,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+readonly ROOT_DIR=$(dirname $0)/..
+source ${ROOT_DIR}/vendor/github.com/knative/test-infra/scripts/library.sh
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-source $(dirname $0)/../vendor/github.com/knative/test-infra/scripts/library.sh
-
-cd ${REPO_ROOT_DIR}
+cd ${ROOT_DIR}
 
 # Ensure we have everything we need under vendor/
 dep ensure
 
+# The license for this is embedded in the readme.
+sed -n '11,41p' vendor/bitbucket.org/ww/goautoneg/README.txt > vendor/bitbucket.org/ww/goautoneg/LICENSE
+
 rm -rf $(find vendor/ -name 'OWNERS')
 rm -rf $(find vendor/ -name '*_test.go')
+rm -rf vendor/github.com/knative/test-infra/devstats
 
 update_licenses third_party/VENDOR-LICENSE "./cmd/*"
-
-# Patch the Kubernetes dynamic client to fix listing. This patch is from
-# https://github.com/kubernetes/kubernetes/pull/68552/files, which is a
-# cherrypick of #66078.  Remove this once that reaches a client version
-# we have pulled in.
-git apply ${REPO_ROOT_DIR}/hack/66078.patch
+remove_broken_symlinks ./vendor

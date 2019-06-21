@@ -16,40 +16,28 @@ limitations under the License.
 
 package activator
 
-const (
-	// K8sServiceName is the name of the activator service
-	K8sServiceName = "activator-service"
-	// RequestCountHTTPHeader is the header key for number of tries
-	RequestCountHTTPHeader string = "knative-activator-num-retries"
-	// RevisionHeaderName is the header key for revision name
-	RevisionHeaderName string = "knative-serving-revision"
-	// RevisionHeaderNamespace is the header key for revision's namespace
-	RevisionHeaderNamespace string = "knative-serving-namespace"
+import (
+	"fmt"
 )
 
-// Activator provides an active endpoint for a revision or an error and
-// status code indicating why it could not.
-type Activator interface {
-	ActiveEndpoint(namespace, name string) ActivationResult
-	Shutdown()
+const (
+	// Name is the name of the component.
+	Name = "activator"
+	// K8sServiceName is the name of the activator Kubernetes service.
+	K8sServiceName = "activator-service"
+	// RevisionHeaderName is the header key for revision name.
+	RevisionHeaderName = "knative-serving-revision"
+	// RevisionHeaderNamespace is the header key for revision's namespace.
+	RevisionHeaderNamespace = "knative-serving-namespace"
+)
+
+// RevisionID is the combination of namespace and revision name
+type RevisionID struct {
+	Namespace string
+	Name      string
 }
 
-type revisionID struct {
-	namespace string
-	name      string
-}
-
-// Endpoint is a fully-qualified domain name / port pair for an active revision.
-type Endpoint struct {
-	FQDN string
-	Port int32
-}
-
-// ActivationResult is used to return the result of an ActivateEndpoint call
-type ActivationResult struct {
-	Status            int
-	Endpoint          Endpoint
-	ServiceName       string
-	ConfigurationName string
-	Error             error
+// String returns the namespaced name of the RevisionID.
+func (rev RevisionID) String() string {
+	return fmt.Sprintf("%s/%s", rev.Namespace, rev.Name)
 }

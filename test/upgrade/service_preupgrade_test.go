@@ -21,46 +21,44 @@ package upgrade
 import (
 	"testing"
 
-	"github.com/knative/pkg/test/logging"
-	serviceresourcenames "github.com/knative/serving/pkg/reconciler/v1alpha1/service/resources/names"
+	revisionresourcenames "github.com/knative/serving/pkg/reconciler/revision/resources/names"
 	"github.com/knative/serving/test"
 	"github.com/knative/serving/test/e2e"
+	v1a1test "github.com/knative/serving/test/v1alpha1"
 )
 
 func TestRunLatestServicePreUpgrade(t *testing.T) {
+	t.Parallel()
 	clients := e2e.Setup(t)
-
-	// Add test case specific name to its own logger.
-	logger := logging.GetContextLogger("TestRunLatestServicePreUpgrade")
 
 	var names test.ResourceNames
 	names.Service = serviceName
-	names.Image = image1
+	names.Image = test.PizzaPlanet1
 
-	logger.Info("Creating a new Service")
-	svc, err := test.CreateLatestService(logger, clients, names)
+	resources, err := v1a1test.CreateRunLatestServiceLegacyReady(t, clients, &names, &v1a1test.Options{})
 	if err != nil {
 		t.Fatalf("Failed to create Service: %v", err)
 	}
-	names.Route = serviceresourcenames.Route(svc)
-	names.Config = serviceresourcenames.Configuration(svc)
+	domain := resources.Service.Status.URL.Host
+	assertServiceResourcesUpdated(t, clients, names, domain, test.PizzaPlanetText1)
+}
 
-	logger.Info("The Service will be updated with the name of the Revision once it is created")
-	revisionName, err := waitForServiceLatestCreatedRevision(clients, names)
+func TestRunLatestServicePreUpgradeAndScaleToZero(t *testing.T) {
+	t.Parallel()
+	clients := e2e.Setup(t)
+
+	var names test.ResourceNames
+	names.Service = scaleToZeroServiceName
+	names.Image = test.PizzaPlanet1
+
+	resources, err := v1a1test.CreateRunLatestServiceLegacyReady(t, clients, &names, &v1a1test.Options{})
 	if err != nil {
-		t.Fatalf("Service %s was not updated with the new revision: %v", names.Service, err)
+		t.Fatalf("Failed to create Service: %v", err)
 	}
-	names.Revision = revisionName
+	domain := resources.Service.Status.URL.Host
+	assertServiceResourcesUpdated(t, clients, names, domain, test.PizzaPlanetText1)
 
-	logger.Info("The Service will be updated with the domain of the Route once it is created")
-	routeDomain, err := waitForServiceDomain(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the new route: %v", names.Service, err)
+	if err := e2e.WaitForScaleToZero(t, revisionresourcenames.Deployment(resources.Revision), clients); err != nil {
+		t.Fatalf("Could not scale to zero: %v", err)
 	}
-
-	logger.Info("When the Service reports as Ready, everything should be ready.")
-	if err := test.WaitForServiceState(clients.ServingClient, names.Service, test.IsServiceReady, "ServiceIsReady"); err != nil {
-		t.Fatalf("The Service %s was not marked as Ready to serve traffic to Revision %s: %v", names.Service, names.Revision, err)
-	}
-	assertServiceResourcesUpdated(t, logger, clients, names, routeDomain, "1", "What a spaceport!")
 }

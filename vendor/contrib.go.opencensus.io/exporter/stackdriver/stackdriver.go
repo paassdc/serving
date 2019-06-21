@@ -62,6 +62,10 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
+
+	commonpb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/common/v1"
+	metricspb "github.com/census-instrumentation/opencensus-proto/gen-go/metrics/v1"
+	resourcepb "github.com/census-instrumentation/opencensus-proto/gen-go/resource/v1"
 )
 
 // Options contains options for configuring the exporter.
@@ -89,15 +93,21 @@ type Options struct {
 	TraceClientOptions []option.ClientOption
 
 	// BundleDelayThreshold determines the max amount of time
-	// the exporter can wait before uploading view data to
+	// the exporter can wait before uploading view data or trace spans to
 	// the backend.
 	// Optional.
 	BundleDelayThreshold time.Duration
 
-	// BundleCountThreshold determines how many view data events
+	// BundleCountThreshold determines how many view data events or trace spans
 	// can be buffered before batch uploading them to the backend.
 	// Optional.
 	BundleCountThreshold int
+
+	// TraceSpansBufferMaxBytes is the maximum size (in bytes) of spans that
+	// will be buffered in memory before being dropped.
+	//
+	// If unset, a default of 8MB will be used.
+	TraceSpansBufferMaxBytes int
 
 	// Resource sets the MonitoredResource against which all views will be
 	// recorded by this exporter.
@@ -190,8 +200,13 @@ type Options struct {
 	// trace and metric clients, and then every time a new batch of traces or
 	// stats needs to be uploaded.
 	//
+	// Do not set a timeout on this context. Instead, set the Timeout option.
+	//
 	// If unset, context.Background() will be used.
 	Context context.Context
+
+	// Timeout for all API calls. If not set, defaults to 5 seconds.
+	Timeout time.Duration
 
 	// GetMonitoredResource may be provided to supply the details of the
 	// monitored resource dynamically based on the tags associated with each
@@ -209,6 +224,8 @@ type Options struct {
 	GetMonitoredResource func(*view.View, []tag.Tag) ([]tag.Tag, monitoredresource.Interface)
 }
 
+const defaultTimeout = 5 * time.Second
+
 // Exporter is a stats and trace exporter that uploads data to Stackdriver.
 //
 // You can create a single Exporter and register it as both a trace exporter
@@ -222,11 +239,12 @@ type Exporter struct {
 // NewExporter creates a new Exporter that implements both stats.Exporter and
 // trace.Exporter.
 func NewExporter(o Options) (*Exporter, error) {
-	if o.Context == nil {
-		o.Context = context.Background()
-	}
 	if o.ProjectID == "" {
-		creds, err := google.FindDefaultCredentials(o.Context, traceapi.DefaultAuthScopes()...)
+		ctx := o.Context
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		creds, err := google.FindDefaultCredentials(ctx, traceapi.DefaultAuthScopes()...)
 		if err != nil {
 			return nil, fmt.Errorf("stackdriver: %v", err)
 		}
@@ -258,6 +276,11 @@ func NewExporter(o Options) (*Exporter, error) {
 // has one or more rows.
 func (e *Exporter) ExportView(vd *view.Data) {
 	e.statsExporter.ExportView(vd)
+}
+
+// ExportMetric exports OpenCensus Metrics to Stackdriver Monitoring.
+func (e *Exporter) ExportMetric(ctx context.Context, node *commonpb.Node, rsc *resourcepb.Resource, metric *metricspb.Metric) error {
+	return e.statsExporter.ExportMetric(ctx, node, rsc, metric)
 }
 
 // ExportSpan exports a SpanData to Stackdriver Trace.
@@ -295,6 +318,18 @@ func (o Options) handleError(err error) {
 		return
 	}
 	log.Printf("Failed to export to Stackdriver: %v", err)
+}
+
+func (o Options) newContextWithTimeout() (context.Context, func()) {
+	ctx := o.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := o.Timeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // convertMonitoredResourceToPB converts MonitoredResource data in to

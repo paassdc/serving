@@ -15,4 +15,9 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: knative-testing
+  name: serving-tests
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: serving-tests-alt

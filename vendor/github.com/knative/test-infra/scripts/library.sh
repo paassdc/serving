@@ -18,16 +18,12 @@
 # to be used in test scripts and the like. It doesn't do anything when
 # called from command line.
 
-# Default GKE version to be used with Knative Serving
-readonly SERVING_GKE_VERSION=latest
-readonly SERVING_GKE_IMAGE=cos
+# GCP project where all tests related resources live
+readonly KNATIVE_TESTS_PROJECT=knative-tests
 
-# Public latest stable nightly images and yaml files.
-readonly KNATIVE_ISTIO_CRD_YAML=https://storage.googleapis.com/knative-nightly/serving/latest/istio-crds.yaml
-readonly KNATIVE_ISTIO_YAML=https://storage.googleapis.com/knative-nightly/serving/latest/istio.yaml
-readonly KNATIVE_SERVING_RELEASE=https://storage.googleapis.com/knative-nightly/serving/latest/release.yaml
-readonly KNATIVE_BUILD_RELEASE=https://storage.googleapis.com/knative-nightly/build/latest/release.yaml
-readonly KNATIVE_EVENTING_RELEASE=https://storage.googleapis.com/knative-nightly/eventing/latest/release.yaml
+# Default GKE version to be used with Knative Serving
+readonly SERVING_GKE_VERSION=gke-latest
+readonly SERVING_GKE_IMAGE=cos
 
 # Conveniently set GOPATH if unset
 if [[ -z "${GOPATH:-}" ]]; then
@@ -40,14 +36,45 @@ fi
 # Useful environment variables
 [[ -n "${PROW_JOB_ID:-}" ]] && IS_PROW=1 || IS_PROW=0
 readonly IS_PROW
-readonly REPO_ROOT_DIR="$(git rev-parse --show-toplevel)"
+[[ -z "${REPO_ROOT_DIR:-}" ]] && REPO_ROOT_DIR="$(git rev-parse --show-toplevel)"
+readonly REPO_ROOT_DIR
+readonly REPO_NAME="$(basename ${REPO_ROOT_DIR})"
+
+# Useful flags about the current OS
+IS_LINUX=0
+IS_OSX=0
+IS_WINDOWS=0
+case "${OSTYPE}" in
+  darwin*) IS_OSX=1 ;;
+  linux*) IS_LINUX=1 ;;
+  msys*) IS_WINDOWS=1 ;;
+  *) echo "** Internal error in library.sh, unknown OS '${OSTYPE}'" ; exit 1 ;;
+esac
+readonly IS_LINUX
+readonly IS_OSX
+readonly IS_WINDOWS
+
+# Set ARTIFACTS to an empty temp dir if unset
+if [[ -z "${ARTIFACTS:-}" ]]; then
+  export ARTIFACTS="$(mktemp -d)"
+fi
+
+# On a Prow job, redirect stderr to stdout so it's synchronously added to log
+(( IS_PROW )) && exec 2>&1
+
+# Print error message and exit 1
+# Parameters: $1..$n - error message to be displayed
+function abort() {
+  echo "error: $@"
+  exit 1
+}
 
 # Display a box banner.
 # Parameters: $1 - character to use for the box.
 #             $2 - banner message.
 function make_banner() {
     local msg="$1$1$1$1 $2 $1$1$1$1"
-    local border="${msg//[-0-9A-Za-z _.,\/]/$1}"
+    local border="${msg//[-0-9A-Za-z _.,\/()\']/$1}"
     echo -e "${border}\n${msg}\n${border}"
 }
 
@@ -72,20 +99,6 @@ function function_exists() {
   [[ "$(type -t $1)" == "function" ]]
 }
 
-# Remove ALL images in the given GCR repository.
-# Parameters: $1 - GCR repository.
-function delete_gcr_images() {
-  for image in $(gcloud --format='value(name)' container images list --repository=$1); do
-    echo "Checking ${image} for removal"
-    delete_gcr_images ${image}
-    for digest in $(gcloud --format='get(digest)' container images list-tags ${image} --limit=99999); do
-      local full_image="${image}@${digest}"
-      echo "Removing ${full_image}"
-      gcloud container images delete -q --force-delete-tags ${full_image}
-    done
-  done
-}
-
 # Waits until the given object doesn't exist.
 # Parameters: $1 - the kind of the object.
 #             $2 - object's name.
@@ -100,8 +113,8 @@ function wait_until_object_does_not_exist() {
   fi
   echo -n "Waiting until ${DESCRIPTION} does not exist"
   for i in {1..150}; do  # timeout after 5 minutes
-    if kubectl ${KUBECTL_ARGS} > /dev/null 2>&1; then
-      echo "\n${DESCRIPTION} does not exist"
+    if ! kubectl ${KUBECTL_ARGS} > /dev/null 2>&1; then
+      echo -e "\n${DESCRIPTION} does not exist"
       return 0
     fi
     echo -n "."
@@ -130,7 +143,7 @@ function wait_until_pods_running() {
         [[ ${status[0]} -lt 1 ]] && all_ready=0 && break
         [[ ${status[1]} -lt 1 ]] && all_ready=0 && break
         [[ ${status[0]} -ne ${status[1]} ]] && all_ready=0 && break
-      done <<< $(echo "${pods}" | grep -v Completed)
+      done <<< "$(echo "${pods}" | grep -v Completed)"
       if (( all_ready )); then
         echo -e "\nAll pods are up:\n${pods}"
         return 0
@@ -140,25 +153,49 @@ function wait_until_pods_running() {
     sleep 2
   done
   echo -e "\n\nERROR: timeout waiting for pods to come up\n${pods}"
-  kubectl get pods -n $1
   return 1
 }
 
-# Waits until the given service has an external IP address.
+# Waits until all batch jobs complete in the given namespace.
+# Parameters: $1 - namespace.
+function wait_until_batch_job_complete() {
+  echo -n "Waiting until all batch jobs in namespace $1 run to completion."
+  for i in {1..150}; do  # timeout after 5 minutes
+    local jobs=$(kubectl get jobs -n $1 --no-headers \
+                 -ocustom-columns='n:{.metadata.name},c:{.spec.completions},s:{.status.succeeded}')
+    # All jobs must be complete
+    local not_complete=$(echo "${jobs}" | awk '{if ($2!=$3) print $0}' | wc -l)
+    if [[ ${not_complete} -eq 0 ]]; then
+      echo -e "\nAll jobs are complete:\n${jobs}"
+      return 0
+    fi
+    echo -n "."
+    sleep 2
+  done
+  echo -e "\n\nERROR: timeout waiting for jobs to complete\n${jobs}"
+  return 1
+}
+
+# Waits until the given service has an external address (IP/hostname).
 # Parameters: $1 - namespace.
 #             $2 - service name.
 function wait_until_service_has_external_ip() {
-  echo -n "Waiting until service $2 in namespace $1 has an external IP"
+  echo -n "Waiting until service $2 in namespace $1 has an external address (IP/hostname)"
   for i in {1..150}; do  # timeout after 15 minutes
     local ip=$(kubectl get svc -n $1 $2 -o jsonpath="{.status.loadBalancer.ingress[0].ip}")
     if [[ -n "${ip}" ]]; then
       echo -e "\nService $2.$1 has IP $ip"
       return 0
     fi
+    local hostname=$(kubectl get svc -n $1 $2 -o jsonpath="{.status.loadBalancer.ingress[0].hostname}")
+    if [[ -n "${hostname}" ]]; then
+      echo -e "\nService $2.$1 has hostname $hostname"
+      return 0
+    fi
     echo -n "."
     sleep 6
   done
-  echo -e "\n\nERROR: timeout waiting for service $svc.$ns to have an external IP"
+  echo -e "\n\nERROR: timeout waiting for service $2.$1 to have an external address"
   kubectl get pods -n $1
   return 1
 }
@@ -171,7 +208,7 @@ function wait_until_routable() {
   for i in {1..150}; do  # timeout after 5 minutes
     local val=$(curl -H "Host: $2" "http://$1" 2>/dev/null)
     if [[ -n "$val" ]]; then
-      echo "\nEndpoint is now routable"
+      echo -e "\nEndpoint is now routable"
       return 0
     fi
     echo -n "."
@@ -198,15 +235,42 @@ function get_app_pods() {
   kubectl get pods ${namespace} --selector=app=$1 --output=jsonpath="{.items[*].metadata.name}"
 }
 
+# Capitalize the first letter of each word.
+# Parameters: $1..$n - words to capitalize.
+function capitalize() {
+  local capitalized=()
+  for word in $@; do
+    local initial="$(echo ${word:0:1}| tr 'a-z' 'A-Z')"
+    capitalized+=("${initial}${word:1}")
+  done
+  echo "${capitalized[@]}"
+}
+
+# Dumps pod logs for the given app.
+# Parameters: $1 - app name.
+#             $2 - namespace.
+function dump_app_logs() {
+  echo ">>> ${REPO_NAME_FORMATTED} $1 logs:"
+  for pod in $(get_app_pods "$1" "$2")
+  do
+    echo ">>> Pod: $pod"
+    kubectl -n "$2" logs "$pod" -c "$1"
+  done
+}
+
 # Sets the given user as cluster admin.
 # Parameters: $1 - user
 #             $2 - cluster name
-#             $3 - cluster zone
+#             $3 - cluster region
+#             $4 - cluster zone, optional
 function acquire_cluster_admin_role() {
+  echo "Acquiring cluster-admin role for user '$1'"
+  local geoflag="--region=$3"
+  [[ -n $4 ]] && geoflag="--zone=$3-$4"
   # Get the password of the admin and use it, as the service account (or the user)
   # might not have the necessary permission.
   local password=$(gcloud --format="value(masterAuth.password)" \
-      container clusters describe $2 --zone=$3)
+      container clusters describe $2 ${geoflag})
   if [[ -n "${password}" ]]; then
     # Cluster created with basic authentication
     kubectl config set-credentials cluster-admin \
@@ -216,9 +280,9 @@ function acquire_cluster_admin_role() {
     local key=$(mktemp)
     echo "Certificate in ${cert}, key in ${key}"
     gcloud --format="value(masterAuth.clientCertificate)" \
-      container clusters describe $2 --zone=$3 | base64 -d > ${cert}
+      container clusters describe $2 ${geoflag} | base64 -d > ${cert}
     gcloud --format="value(masterAuth.clientKey)" \
-      container clusters describe $2 --zone=$3 | base64 -d > ${key}
+      container clusters describe $2 ${geoflag} | base64 -d > ${key}
     kubectl config set-credentials cluster-admin \
       --client-certificate=${cert} --client-key=${key}
   fi
@@ -229,10 +293,10 @@ function acquire_cluster_admin_role() {
       --user=$1
   # Reset back to the default account
   gcloud container clusters get-credentials \
-      $2 --zone=$3 --project $(gcloud config get-value project)
+      $2 ${geoflag} --project $(gcloud config get-value project)
 }
 
-# Runs a go test and generate a junit summary through bazel.
+# Runs a go test and generate a junit summary.
 # Parameters: $1... - parameters to go test
 function report_go_test() {
   # Run tests in verbose mode to capture details.
@@ -240,134 +304,51 @@ function report_go_test() {
   local args=" $@ "
   local go_test="go test -race -v ${args/ -v / }"
   # Just run regular go tests if not on Prow.
-  if (( ! IS_PROW )); then
-    ${go_test}
-    return
-  fi
   echo "Running tests with '${go_test}'"
   local report=$(mktemp)
-  local failed=0
-  local test_count=0
-  local tests_failed=0
-  ${go_test} > ${report} || failed=$?
+  ${go_test} | tee ${report}
+  local failed=( ${PIPESTATUS[@]} )
+  [[ ${failed[0]} -eq 0 ]] && failed=${failed[1]} || failed=${failed[0]}
   echo "Finished run, return code is ${failed}"
-  # Tests didn't run.
-  [[ ! -s ${report} ]] && return 1
-  # Create WORKSPACE file, required to use bazel, if necessary.
-  touch WORKSPACE
-  local targets=""
-  local last_run=""
-  local test_files=""
-  # Parse the report and generate fake tests for each passing/failing test.
-  echo "Start parsing results, summary:"
-  while read line ; do
-    local fields=(`echo -n ${line}`)
-    local field0="${fields[0]}"
-    local field1="${fields[1]}"
-    local name="${fields[2]}"
-    # Deal with a SIGQUIT log entry (usually a test timeout).
-    # This is a fallback in case there's no kill signal log entry.
-    # SIGQUIT: quit
-    if [[ "${field0}" == "SIGQUIT:" ]]; then
-      name="${last_run}"
-      field1="FAIL:"
-      error="${fields[@]}"
-    fi
-    # Ignore subtests (those containing slashes)
-    if [[ -n "${name##*/*}" ]]; then
-      local error=""
-      # Deal with a kill signal log entry (usually a test timeout).
-      # *** Test killed with quit: ran too long (10m0s).
-      if [[ "${field0}" == "***" ]]; then
-        name="${last_run}"
-        field1="FAIL:"
-        error="${fields[@]:1}"
-      fi
-      # Deal with a fatal log entry, which has a different format:
-      # fatal   TestFoo   foo_test.go:275 Expected "foo" but got "bar"
-      if [[ "${field0}" == "fatal" ]]; then
-        name="${field1}"
-        field1="FAIL:"
-        error="${fields[@]:3}"
-      fi
-      # Keep track of the test currently running.
-      if [[ "${field1}" == "RUN" ]]; then
-        last_run="${name}"
-      fi
-      # Handle regular go test pass/fail entry for a test.
-      if [[ "${field1}" == "PASS:" || "${field1}" == "FAIL:" ]]; then
-        echo "- ${name} :${field1}"
-        test_count=$(( test_count + 1 ))
-        local src="${name}.sh"
-        echo "exit 0" > ${src}
-        if [[ "${field1}" == "FAIL:" ]]; then
-          tests_failed=$(( tests_failed + 1 ))
-          [[ -z "${error}" ]] && read error
-          echo "cat <<ERROR-EOF" > ${src}
-          echo "${error}" >> ${src}
-          echo "ERROR-EOF" >> ${src}
-          echo "exit 1" >> ${src}
-        fi
-        chmod +x ${src}
-        test_files="${test_files} ${src}"
-        # Populate BUILD.bazel
-        echo "sh_test(name=\"${name}\", srcs=[\"${src}\"])" >> BUILD.bazel
-      elif [[ "${field0}" == "FAIL" || "${field0}" == "ok" ]] && [[ -n "${field1}" ]]; then
-        echo "- ${field0} ${field1}"
-        # Create the package structure, move tests and BUILD file
-        local package=${field1/github.com\//}
-        local bazel_files="$(ls -1 ${test_files} BUILD.bazel 2> /dev/null)"
-        if [[ -n "${bazel_files}" ]]; then
-          mkdir -p ${package}
-          targets="${targets} //${package}/..."
-          mv ${bazel_files} ${package}
-        else
-          echo "*** INTERNAL ERROR: missing tests for ${package}, got [${bazel_files/$'\n'/, }]"
-        fi
-        test_files=""
-      fi
-    fi
-  done < ${report}
-  echo "Done parsing ${test_count} tests, ${tests_failed} tests failed"
-  # If any test failed, show the detailed report.
-  # Otherwise, we already shown the summary.
-  # Exception: when emitting metrics, dump the full report.
-  if (( failed )) || [[ "$@" == *" -emitmetrics"* ]]; then
-    if (( failed )); then
-      echo "There were ${tests_failed} test failures, full log:"
-    else
-      echo "Dumping full log as metrics were requested:"
-    fi
-    cat ${report}
+  # Install go-junit-report if necessary.
+  run_go_tool github.com/jstemmer/go-junit-report go-junit-report --help > /dev/null 2>&1
+  local xml=$(mktemp ${ARTIFACTS}/junit_XXXXXXXX.xml)
+  cat ${report} \
+      | go-junit-report \
+      | sed -e "s#\"github.com/knative/${REPO_NAME}/#\"#g" \
+      > ${xml}
+  echo "XML report written to ${xml}"
+  if (( ! IS_PROW )); then
+    # Keep the suffix, so files are related.
+    local logfile=${xml/junit_/go_test_}
+    logfile=${logfile/.xml/.log}
+    cp ${report} ${logfile}
+    echo "Test log written to ${logfile}"
   fi
-  # Always generate the junit summary.
-  bazel test ${targets} > /dev/null 2>&1 || true
   return ${failed}
 }
 
-# Install the latest stable Knative/serving in the current cluster.
-function start_latest_knative_serving() {
+# Install Knative Serving in the current cluster.
+# Parameters: $1 - Knative Serving manifest.
+function start_knative_serving() {
   header "Starting Knative Serving"
-  subheader "Installing Istio"
-  kubectl apply -f ${KNATIVE_ISTIO_CRD_YAML} || return 1
-  kubectl apply -f ${KNATIVE_ISTIO_YAML} || return 1
-  wait_until_pods_running istio-system || return 1
-  kubectl label namespace default istio-injection=enabled || return 1
   subheader "Installing Knative Serving"
-  kubectl apply -f ${KNATIVE_SERVING_RELEASE} || return 1
+  echo "Installing Serving CRDs from $1"
+  kubectl apply --selector knative.dev/crd-install=true -f "$1"
+  echo "Installing the rest of serving components from $1"
+  kubectl apply -f "$1"
   wait_until_pods_running knative-serving || return 1
-  wait_until_pods_running knative-build || return 1
 }
 
-# Install the latest stable Knative/build in the current cluster.
-function start_latest_knative_build() {
-  header "Starting Knative Build"
-  subheader "Installing Istio"
-  kubectl apply -f ${KNATIVE_ISTIO_YAML} || return 1
-  wait_until_pods_running istio-system || return 1
-  subheader "Installing Knative Build"
-  kubectl apply -f ${KNATIVE_BUILD_RELEASE} || return 1
-  wait_until_pods_running knative-build || return 1
+# Install the stable release Knative/serving in the current cluster.
+# Parameters: $1 - Knative Serving version number, e.g. 0.6.0.
+function start_release_knative_serving() {
+  start_knative_serving "https://storage.googleapis.com/knative-releases/serving/previous/v$1/serving.yaml"
+}
+
+# Install the latest stable Knative Serving in the current cluster.
+function start_latest_knative_serving() {
+  start_knative_serving "${KNATIVE_SERVING_RELEASE}"
 }
 
 # Run a go tool, installing it first if necessary.
@@ -427,13 +408,114 @@ function run_lint_tool() {
 # Check links in the given markdown files.
 # Parameters: $1...$n - files to inspect
 function check_links_in_markdown() {
-  # https://github.com/tcort/markdown-link-check
-  run_lint_tool markdown-link-check "checking links in markdown files" -q $@
+  # https://github.com/raviqqe/liche
+  local config="${REPO_ROOT_DIR}/test/markdown-link-check-config.rc"
+  [[ ! -e ${config} ]] && config="${_TEST_INFRA_SCRIPTS_DIR}/markdown-link-check-config.rc"
+  local options="$(grep '^-' ${config} | tr \"\n\" ' ')"
+  run_lint_tool liche "checking links in markdown files" "-d ${REPO_ROOT_DIR} ${options}" $@
 }
 
 # Check format of the given markdown files.
-# Parameters: $1...$n - files to inspect
+# Parameters: $1..$n - files to inspect
 function lint_markdown() {
   # https://github.com/markdownlint/markdownlint
-  run_lint_tool mdl "linting markdown files" "-r ~MD013" $@
+  local config="${REPO_ROOT_DIR}/test/markdown-lint-config.rc"
+  [[ ! -e ${config} ]] && config="${_TEST_INFRA_SCRIPTS_DIR}/markdown-lint-config.rc"
+  run_lint_tool mdl "linting markdown files" "-c ${config}" $@
 }
+
+# Return whether the given parameter is an integer.
+# Parameters: $1 - integer to check
+function is_int() {
+  [[ -n $1 && $1 =~ ^[0-9]+$ ]]
+}
+
+# Return whether the given parameter is the knative release/nightly GCF.
+# Parameters: $1 - full GCR name, e.g. gcr.io/knative-foo-bar
+function is_protected_gcr() {
+  [[ -n $1 && $1 =~ ^gcr.io/knative-(releases|nightly)/?$ ]]
+}
+
+# Return whether the given parameter is any cluster under ${KNATIVE_TESTS_PROJECT}.
+# Parameters: $1 - Kubernetes cluster context (output of kubectl config current-context)
+function is_protected_cluster() {
+  # Example: gke_knative-tests_us-central1-f_prow
+  [[ -n $1 && $1 =~ ^gke_${KNATIVE_TESTS_PROJECT}_us\-[a-zA-Z0-9]+\-[a-z]+_[a-z0-9\-]+$ ]]
+}
+
+# Return whether the given parameter is ${KNATIVE_TESTS_PROJECT}.
+# Parameters: $1 - project name
+function is_protected_project() {
+  [[ -n $1 && "$1" == "${KNATIVE_TESTS_PROJECT}" ]]
+}
+
+# Remove symlinks in a path that are broken or lead outside the repo.
+# Parameters: $1 - path name, e.g. vendor
+function remove_broken_symlinks() {
+  for link in $(find $1 -type l); do
+    # Remove broken symlinks
+    if [[ ! -e ${link} ]]; then
+      unlink ${link}
+      continue
+    fi
+    # Get canonical path to target, remove if outside the repo
+    local target="$(ls -l ${link})"
+    target="${target##* -> }"
+    [[ ${target} == /* ]] || target="./${target}"
+    target="$(cd `dirname ${link}` && cd ${target%/*} && echo $PWD/${target##*/})"
+    if [[ ${target} != *github.com/knative/* ]]; then
+      unlink ${link}
+      continue
+    fi
+  done
+}
+
+# Returns the canonical path of a filesystem object.
+# Parameters: $1 - path to return in canonical form
+#             $2 - base dir for relative links; optional, defaults to current
+function get_canonical_path() {
+  # We don't use readlink because it's not available on every platform.
+  local path=$1
+  local pwd=${2:-.}
+  [[ ${path} == /* ]] || path="${pwd}/${path}"
+  echo "$(cd ${path%/*} && echo $PWD/${path##*/})"
+}
+
+# Returns the URL to the latest manifest for the given Knative project.
+# Parameters: $1 - repository name of the given project
+#             $2 - name of the yaml file, without extension
+function get_latest_knative_yaml_source() {
+  local branch_name=""
+  local repo_name="$1"
+  local yaml_name="$2"
+  # Get the branch name from Prow's env var, see https://github.com/kubernetes/test-infra/blob/master/prow/jobs.md.
+  # Otherwise, try getting the current branch from git.
+  (( IS_PROW )) && branch_name="${PULL_BASE_REF:-}"
+  [[ -z "${branch_name}" ]] && branch_name="$(git rev-parse --abbrev-ref HEAD)"
+  # If it's a release branch, the yaml source URL should point to a specific version.
+  if [[ ${branch_name} =~ ^release-[0-9\.]+$ ]]; then
+    # Get the latest tag name for the current branch, which is likely formatted as v0.5.0
+    local tag_name="$(git describe --tags --abbrev=0)"
+    # The given repo might not have this tag, so we need to find its latest release manifest with the same major&minor version.
+    local major_minor="$(echo ${tag_name} | cut -d. -f1-2)"
+    local yaml_source_path="$(gsutil ls gs://knative-releases/${repo_name}/previous/${major_minor}.*/${yaml_name}.yaml \
+      | sort \
+      | tail -n 1 \
+      | cut -b6-)"
+    echo "https://storage.googleapis.com/${yaml_source_path}"
+  # If it's not a release branch, the yaml source URL should be nightly build.
+  else
+    echo "https://storage.googleapis.com/knative-nightly/${repo_name}/latest/${yaml_name}.yaml"
+  fi
+}
+
+# Initializations that depend on previous functions.
+# These MUST come last.
+
+readonly _TEST_INFRA_SCRIPTS_DIR="$(dirname $(get_canonical_path ${BASH_SOURCE[0]}))"
+readonly REPO_NAME_FORMATTED="Knative $(capitalize ${REPO_NAME//-/})"
+
+# Public latest nightly or release yaml files.
+readonly KNATIVE_SERVING_RELEASE="$(get_latest_knative_yaml_source "serving" "serving")"
+readonly KNATIVE_BUILD_RELEASE="$(get_latest_knative_yaml_source "build" "build")"
+readonly KNATIVE_EVENTING_RELEASE="$(get_latest_knative_yaml_source "eventing" "release")"

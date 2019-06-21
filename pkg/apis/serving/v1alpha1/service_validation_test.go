@@ -17,31 +17,46 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/knative/serving/pkg/apis/config"
 
 	"github.com/google/go-cmp/cmp"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/knative/pkg/apis"
+	"github.com/knative/pkg/ptr"
+	"github.com/knative/serving/pkg/apis/serving/v1beta1"
 )
+
+const incorrectDNS1035Label = "not a DNS 1035 label: [a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character (e.g. 'my-name',  or 'abc-123', regex used for validation is '[a-z]([-a-z0-9]*[a-z0-9])?')]"
 
 func TestServiceValidation(t *testing.T) {
 	tests := []struct {
 		name string
 		s    *Service
+		wc   func(context.Context) context.Context
 		want *apis.FieldError
 	}{{
 		name: "valid runLatest",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				RunLatest: &RunLatestType{
+				DeprecatedRunLatest: &RunLatestType{
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
-									Image: "hellworld",
+								RevisionSpec: v1beta1.RevisionSpec{
+									PodSpec: corev1.PodSpec{
+										Containers: []corev1.Container{{
+											Image: "hellworld",
+										}},
+									},
 								},
 							},
 						},
@@ -50,16 +65,47 @@ func TestServiceValidation(t *testing.T) {
 			},
 		},
 		want: nil,
+	}, {
+		name: "invalid runLatest (has spec.generation)",
+		wc:   apis.DisallowDeprecated,
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedGeneration: 12,
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								RevisionSpec: v1beta1.RevisionSpec{
+									PodSpec: corev1.PodSpec{
+										Containers: []corev1.Container{{
+											Image: "hellworld",
+										}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrDisallowedFields("spec.generation", "spec.runLatest",
+			"spec.runLatest.configuration.revisionTemplate"),
 	}, {
 		name: "valid pinned",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Pinned: &PinnedType{
+				DeprecatedPinned: &PinnedType{
 					RevisionName: "asdf",
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -70,15 +116,46 @@ func TestServiceValidation(t *testing.T) {
 		},
 		want: nil,
 	}, {
+		name: "valid pinned (deprecated disallowed)",
+		wc:   apis.DisallowDeprecated,
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedPinned: &PinnedType{
+					RevisionName: "asdf",
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								RevisionSpec: v1beta1.RevisionSpec{
+									PodSpec: corev1.PodSpec{
+										Containers: []corev1.Container{{
+											Image: "hellworld",
+										}},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrDisallowedFields("spec.pinned",
+			"spec.pinned.configuration.revisionTemplate"),
+	}, {
 		name: "valid release -- one revision",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Release: &ReleaseType{
+				DeprecatedRelease: &ReleaseType{
 					Revisions: []string{"asdf"},
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -91,14 +168,17 @@ func TestServiceValidation(t *testing.T) {
 	}, {
 		name: "valid release -- two revisions",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Release: &ReleaseType{
+				DeprecatedRelease: &ReleaseType{
 					Revisions:      []string{"asdf", "fdsa"},
 					RolloutPercent: 42,
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -111,32 +191,38 @@ func TestServiceValidation(t *testing.T) {
 	}, {
 		name: "valid manual",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Manual: &ManualType{},
+				DeprecatedManual: &ManualType{},
 			},
 		},
-		want: nil,
+		want: apis.ErrDisallowedFields("spec.manual"),
 	}, {
 		name: "invalid multiple types",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				RunLatest: &RunLatestType{
+				DeprecatedRunLatest: &RunLatestType{
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
 						},
 					},
 				},
-				Pinned: &PinnedType{
+				DeprecatedPinned: &PinnedType{
 					RevisionName: "asdf",
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -151,22 +237,31 @@ func TestServiceValidation(t *testing.T) {
 		},
 	}, {
 		name: "invalid missing type",
-		s:    &Service{},
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+		},
 		want: &apis.FieldError{
 			Message: "expected exactly one, got neither",
-			Paths:   []string{"spec.manual", "spec.pinned", "spec.release", "spec.runLatest"},
+			Paths: []string{"spec.pinned", "spec.release",
+				"spec.template", "spec.runLatest"},
 		},
 	}, {
 		name: "invalid runLatest",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				RunLatest: &RunLatestType{
+				DeprecatedRunLatest: &RunLatestType{
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
-									Name:  "foo",
-									Image: "hellworld",
+								DeprecatedContainer: &corev1.Container{
+									Name:      "foo",
+									Image:     "hellworld",
+									Lifecycle: &corev1.Lifecycle{},
 								},
 							},
 						},
@@ -174,19 +269,23 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: apis.ErrDisallowedFields("spec.runLatest.configuration.revisionTemplate.spec.container.name"),
+		want: apis.ErrDisallowedFields("spec.runLatest.configuration.revisionTemplate.spec.container.lifecycle"),
 	}, {
 		name: "invalid pinned",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Pinned: &PinnedType{
+				DeprecatedPinned: &PinnedType{
 					RevisionName: "asdf",
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
-									Name:  "foo",
-									Image: "hellworld",
+								DeprecatedContainer: &corev1.Container{
+									Name:      "foo",
+									Image:     "hellworld",
+									Lifecycle: &corev1.Lifecycle{},
 								},
 							},
 						},
@@ -194,16 +293,19 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: apis.ErrDisallowedFields("spec.pinned.configuration.revisionTemplate.spec.container.name"),
+		want: apis.ErrDisallowedFields("spec.pinned.configuration.revisionTemplate.spec.container.lifecycle"),
 	}, {
 		name: "invalid release -- too few revisions; nil",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Release: &ReleaseType{
+				DeprecatedRelease: &ReleaseType{
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -214,15 +316,84 @@ func TestServiceValidation(t *testing.T) {
 		},
 		want: apis.ErrMissingField("spec.release.revisions"),
 	}, {
+		name: "invalid release -- revision name invalid, long",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions: []string{strings.Repeat("a", 64)},
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrInvalidValue("not a DNS 1035 label: [must be no more than 63 characters]", "spec.release.revisions[0]"),
+	}, {
+		name: "invalid release -- revision name invalid, incorrect",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions: []string{".negative"},
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrInvalidValue(incorrectDNS1035Label, "spec.release.revisions[0]"),
+	}, {
+		name: "valid release -- with @latest",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions: []string{"s-1-00001", ReleaseLatestRevisionKeyword},
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: nil,
+	}, {
 		name: "invalid release -- too few revisions; empty slice",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Release: &ReleaseType{
+				DeprecatedRelease: &ReleaseType{
 					Revisions: []string{},
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -235,13 +406,106 @@ func TestServiceValidation(t *testing.T) {
 	}, {
 		name: "invalid release -- too many revisions",
 		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: ServiceSpec{
-				Release: &ReleaseType{
+				DeprecatedRelease: &ReleaseType{
 					Revisions: []string{"asdf", "fdsa", "abcde"},
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrOutOfBoundsValue(3, 1, 2, "spec.release.revisions"),
+	}, {
+		name: "invalid release -- rollout greater than 99",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions:      []string{"asdf", "fdsa"},
+					RolloutPercent: 100,
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrOutOfBoundsValue(100, 0, 99, "spec.release.rolloutPercent"),
+	}, {
+		name: "invalid release -- rollout less than 0",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions:      []string{"asdf", "fdsa"},
+					RolloutPercent: -50,
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrOutOfBoundsValue(-50, 0, 99, "spec.release.rolloutPercent"),
+	}, {
+		name: "invalid release -- non-zero rollout for single revision",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions:      []string{"asdf"},
+					RolloutPercent: 10,
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: apis.ErrInvalidValue(10, "spec.release.rolloutPercent"),
+	}, {
+		name: "invalid name - dots",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "do.not.use.dots",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -251,102 +515,21 @@ func TestServiceValidation(t *testing.T) {
 			},
 		},
 		want: &apis.FieldError{
-			Message: "expected number of elements in range [1, 2], got 3",
-			Paths:   []string{"spec.release.revisions"},
+			Message: incorrectDNS1035Label,
+			Paths:   []string{"metadata.name"},
 		},
-	}, {
-		name: "invalid release -- rollout greater than 99",
-		s: &Service{
-			Spec: ServiceSpec{
-				Release: &ReleaseType{
-					Revisions:      []string{"asdf", "fdsa"},
-					RolloutPercent: 100,
-					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
-							Spec: RevisionSpec{
-								Container: corev1.Container{
-									Image: "hellworld",
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		want: apis.ErrInvalidValue("100", "spec.release.rolloutPercent"),
-	}, {
-		name: "invalid release -- rollout less than 0",
-		s: &Service{
-			Spec: ServiceSpec{
-				Release: &ReleaseType{
-					Revisions:      []string{"asdf", "fdsa"},
-					RolloutPercent: -50,
-					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
-							Spec: RevisionSpec{
-								Container: corev1.Container{
-									Image: "hellworld",
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		want: apis.ErrInvalidValue("-50", "spec.release.rolloutPercent"),
-	}, {
-		name: "invalid release -- non-zero rollout for single revision",
-		s: &Service{
-			Spec: ServiceSpec{
-				Release: &ReleaseType{
-					Revisions:      []string{"asdf"},
-					RolloutPercent: 10,
-					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
-							Spec: RevisionSpec{
-								Container: corev1.Container{
-									Image: "hellworld",
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		want: apis.ErrInvalidValue("10", "spec.release.rolloutPercent"),
-	}, {
-		name: "invalid name - dots",
-		s: &Service{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "do.not.use.dots",
-			},
-			Spec: ServiceSpec{
-				RunLatest: &RunLatestType{
-					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
-							Spec: RevisionSpec{
-								Container: corev1.Container{
-									Image: "hellworld",
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		want: &apis.FieldError{Message: "Invalid resource name: special character . must not be present", Paths: []string{"metadata.name"}},
 	}, {
 		name: "invalid name - too long",
 		s: &Service{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: strings.Repeat("a", 65),
+				Name: strings.Repeat("a", 64),
 			},
 			Spec: ServiceSpec{
-				RunLatest: &RunLatestType{
+				DeprecatedRunLatest: &RunLatestType{
 					Configuration: ConfigurationSpec{
-						RevisionTemplate: RevisionTemplateSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 							Spec: RevisionSpec{
-								Container: corev1.Container{
+								DeprecatedContainer: &corev1.Container{
 									Image: "hellworld",
 								},
 							},
@@ -355,14 +538,178 @@ func TestServiceValidation(t *testing.T) {
 				},
 			},
 		},
-		want: &apis.FieldError{Message: "Invalid resource name: length must be no more than 63 characters", Paths: []string{"metadata.name"}},
+		want: &apis.FieldError{
+			Message: "not a DNS 1035 label: [must be no more than 63 characters]",
+			Paths:   []string{"metadata.name"},
+		},
+	}, {
+		name: "runLatest with traffic",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "invalid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "hellworld",
+								},
+							},
+						},
+					},
+				},
+				RouteSpec: RouteSpec{
+					Traffic: []TrafficTarget{{
+						TrafficTarget: v1beta1.TrafficTarget{
+							LatestRevision: ptr.Bool(true),
+							Percent:        100,
+						},
+					}},
+				},
+			},
+		},
+		want: apis.ErrMultipleOneOf("spec.runLatest", "spec.traffic"),
+	}, {
+		name: "valid v1beta1 subset (pinned)",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				ConfigurationSpec: ConfigurationSpec{
+					Template: &RevisionTemplateSpec{
+						Spec: RevisionSpec{
+							RevisionSpec: v1beta1.RevisionSpec{
+								PodSpec: corev1.PodSpec{
+									Containers: []corev1.Container{{
+										Image: "helloworld",
+									}},
+								},
+							},
+						},
+					},
+				},
+				RouteSpec: RouteSpec{
+					Traffic: []TrafficTarget{{
+						TrafficTarget: v1beta1.TrafficTarget{
+							RevisionName: "valid-00001",
+							Percent:      100,
+						},
+					}},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "invalid v1beta1 subset (deprecated field within inline spec)",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				ConfigurationSpec: ConfigurationSpec{
+					Template: &RevisionTemplateSpec{
+						Spec: RevisionSpec{
+							DeprecatedConcurrencyModel: "Multi",
+							RevisionSpec: v1beta1.RevisionSpec{
+								PodSpec: corev1.PodSpec{
+									Containers: []corev1.Container{{
+										Image: "helloworld",
+									}},
+								},
+							},
+						},
+					},
+				},
+				RouteSpec: RouteSpec{
+					Traffic: []TrafficTarget{{
+						TrafficTarget: v1beta1.TrafficTarget{
+							RevisionName: "valid-00001",
+							Percent:      100,
+						},
+					}},
+				},
+			},
+		},
+		want: apis.ErrDisallowedFields("spec.template.spec.concurrencyModel"),
+	}, {
+		name: "valid v1beta1 subset (run latest)",
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				ConfigurationSpec: ConfigurationSpec{
+					Template: &RevisionTemplateSpec{
+						Spec: RevisionSpec{
+							RevisionSpec: v1beta1.RevisionSpec{
+								PodSpec: corev1.PodSpec{
+									Containers: []corev1.Container{{
+										Image: "helloworld",
+									}},
+								},
+							},
+						},
+					},
+				},
+				RouteSpec: RouteSpec{
+					Traffic: []TrafficTarget{{
+						TrafficTarget: v1beta1.TrafficTarget{
+							LatestRevision: ptr.Bool(true),
+							Percent:        100,
+						},
+					}},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "valid inline",
+		// Should not affect anything.
+		wc: apis.DisallowDeprecated,
+		s: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				ConfigurationSpec: ConfigurationSpec{
+					Template: &RevisionTemplateSpec{
+						Spec: RevisionSpec{
+							RevisionSpec: v1beta1.RevisionSpec{
+								PodSpec: corev1.PodSpec{
+									Containers: []corev1.Container{{
+										Image: "hellworld",
+									}},
+								},
+							},
+						},
+					},
+				},
+				RouteSpec: RouteSpec{
+					Traffic: []TrafficTarget{{
+						TrafficTarget: v1beta1.TrafficTarget{
+							Percent: 100,
+						},
+					}},
+				},
+			},
+		},
+		want: nil,
 	}}
+
+	// TODO(mattmoor): Add a test for default configurationName
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.s.Validate()
+			ctx := context.Background()
+			if test.wc != nil {
+				ctx = test.wc(ctx)
+			}
+			got := test.s.Validate(ctx)
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
-				t.Errorf("validateContainer (-want, +got) = %v", diff)
+				t.Errorf("Validate() (-want, +got) = %v", diff)
 			}
 		})
 	}
@@ -377,9 +724,9 @@ func TestRunLatestTypeValidation(t *testing.T) {
 		name: "valid",
 		rlt: &RunLatestType{
 			Configuration: ConfigurationSpec{
-				RevisionTemplate: RevisionTemplateSpec{
+				DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 					Spec: RevisionSpec{
-						Container: corev1.Container{
+						DeprecatedContainer: &corev1.Container{
 							Image: "hellworld",
 						},
 					},
@@ -391,22 +738,23 @@ func TestRunLatestTypeValidation(t *testing.T) {
 		name: "propagate revision failures",
 		rlt: &RunLatestType{
 			Configuration: ConfigurationSpec{
-				RevisionTemplate: RevisionTemplateSpec{
+				DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 					Spec: RevisionSpec{
-						Container: corev1.Container{
-							Name:  "stuart",
-							Image: "hellworld",
+						DeprecatedContainer: &corev1.Container{
+							Name:      "stuart",
+							Image:     "hellworld",
+							Lifecycle: &corev1.Lifecycle{},
 						},
 					},
 				},
 			},
 		},
-		want: apis.ErrDisallowedFields("configuration.revisionTemplate.spec.container.name"),
+		want: apis.ErrDisallowedFields("configuration.revisionTemplate.spec.container.lifecycle"),
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.rlt.Validate()
+			got := test.rlt.Validate(context.Background())
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("validateContainer (-want, +got) = %v", diff)
 			}
@@ -424,9 +772,9 @@ func TestPinnedTypeValidation(t *testing.T) {
 		pt: &PinnedType{
 			RevisionName: "foo",
 			Configuration: ConfigurationSpec{
-				RevisionTemplate: RevisionTemplateSpec{
+				DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 					Spec: RevisionSpec{
-						Container: corev1.Container{
+						DeprecatedContainer: &corev1.Container{
 							Image: "hellworld",
 						},
 					},
@@ -438,9 +786,9 @@ func TestPinnedTypeValidation(t *testing.T) {
 		name: "missing revision name",
 		pt: &PinnedType{
 			Configuration: ConfigurationSpec{
-				RevisionTemplate: RevisionTemplateSpec{
+				DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 					Spec: RevisionSpec{
-						Container: corev1.Container{
+						DeprecatedContainer: &corev1.Container{
 							Image: "hellworld",
 						},
 					},
@@ -453,24 +801,428 @@ func TestPinnedTypeValidation(t *testing.T) {
 		pt: &PinnedType{
 			RevisionName: "foo",
 			Configuration: ConfigurationSpec{
-				RevisionTemplate: RevisionTemplateSpec{
+				DeprecatedRevisionTemplate: &RevisionTemplateSpec{
 					Spec: RevisionSpec{
-						Container: corev1.Container{
-							Name:  "stuart",
-							Image: "hellworld",
+						DeprecatedContainer: &corev1.Container{
+							Name:      "stuart",
+							Image:     "hellworld",
+							Lifecycle: &corev1.Lifecycle{},
 						},
 					},
 				},
 			},
 		},
-		want: apis.ErrDisallowedFields("configuration.revisionTemplate.spec.container.name"),
+		want: apis.ErrDisallowedFields("configuration.revisionTemplate.spec.container.lifecycle"),
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.pt.Validate()
+			got := test.pt.Validate(context.Background())
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("validateContainer (-want, +got) = %v", diff)
+			}
+		})
+	}
+}
+
+func TestImmutableServiceFields(t *testing.T) {
+	tests := []struct {
+		name string
+		new  *Service
+		old  *Service
+		want *apis.FieldError
+	}{{
+		name: "without byo-name",
+		new: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "no-byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		old: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "no-byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:bar",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "good byo-name (name change)",
+		new: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-foo",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		old: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-bar",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:bar",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "good byo-name (mode change, no delta)",
+		new: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-foo",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		old: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions: []string{"foo"},
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-foo",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "good byo-name (mode change, with delta)",
+		new: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedPinned: &PinnedType{
+					RevisionName: "bar",
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-foo",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		old: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				ConfigurationSpec: ConfigurationSpec{
+					Template: &RevisionTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "byo-name-bar",
+						},
+						Spec: RevisionSpec{
+							RevisionSpec: v1beta1.RevisionSpec{
+								PodSpec: corev1.PodSpec{
+									Containers: []corev1.Container{{
+										Image: "helloworld:bar",
+									}},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "good byo-name (mode change to manual)",
+		new: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedPinned: &PinnedType{
+					RevisionName: "bar",
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-foo",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:bar",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		old: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedManual: &ManualType{},
+			},
+		},
+		want: nil,
+	}, {
+		name: "bad byo-name (mode change, with delta)",
+		new: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-foo",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		old: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "byo-name",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRelease: &ReleaseType{
+					Revisions: []string{"foo"},
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{
+								Name: "byo-name-foo",
+							},
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld:bar",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		want: &apis.FieldError{
+			Message: "Saw the following changes without a name change (-old +new)",
+			Paths:   []string{"spec.runLatest.configuration.revisionTemplate"},
+			Details: "{*v1alpha1.RevisionTemplateSpec}.Spec.DeprecatedContainer.Image:\n\t-: \"helloworld:bar\"\n\t+: \"helloworld:foo\"\n",
+		},
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			ctx = apis.WithinUpdate(ctx, test.old)
+			got := test.new.Validate(ctx)
+			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
+				t.Errorf("Validate (-want, +got) = %v", diff)
+			}
+		})
+	}
+}
+
+func TestServiceSubresourceUpdate(t *testing.T) {
+	tests := []struct {
+		name        string
+		service     *Service
+		subresource string
+		want        *apis.FieldError
+	}{{
+		name: "status update with valid revision template",
+		service: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld",
+								},
+								RevisionSpec: v1beta1.RevisionSpec{
+									TimeoutSeconds: ptr.Int64(config.DefaultMaxRevisionTimeoutSeconds - 1),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		subresource: "status",
+		want:        nil,
+	}, {
+		name: "status update with invalid revision template",
+		service: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld",
+								},
+								RevisionSpec: v1beta1.RevisionSpec{
+									TimeoutSeconds: ptr.Int64(config.DefaultMaxRevisionTimeoutSeconds + 1),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		subresource: "status",
+		want:        nil,
+	}, {
+		name: "non-status sub resource update with valid revision template",
+		service: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld",
+								},
+								RevisionSpec: v1beta1.RevisionSpec{
+									TimeoutSeconds: ptr.Int64(config.DefaultMaxRevisionTimeoutSeconds - 1),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		subresource: "foo",
+		want:        nil,
+	}, {
+		name: "non-status sub resource update with invalid revision template",
+		service: &Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+			Spec: ServiceSpec{
+				DeprecatedRunLatest: &RunLatestType{
+					Configuration: ConfigurationSpec{
+						DeprecatedRevisionTemplate: &RevisionTemplateSpec{
+							Spec: RevisionSpec{
+								DeprecatedContainer: &corev1.Container{
+									Image: "helloworld",
+								},
+								RevisionSpec: v1beta1.RevisionSpec{
+									TimeoutSeconds: ptr.Int64(config.DefaultMaxRevisionTimeoutSeconds + 1),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		subresource: "foo",
+		want: apis.ErrOutOfBoundsValue(config.DefaultMaxRevisionTimeoutSeconds+1, 0,
+			config.DefaultMaxRevisionTimeoutSeconds,
+			"spec.runLatest.configuration.revisionTemplate.spec.timeoutSeconds"),
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			ctx = apis.WithinSubResourceUpdate(ctx, test.service, test.subresource)
+			got := test.service.Validate(ctx)
+			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
+				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
 		})
 	}

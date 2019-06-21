@@ -20,106 +20,97 @@ package e2e
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	pkgTest "github.com/knative/pkg/test"
-	"github.com/knative/pkg/test/logging"
-	"github.com/knative/serving/test"
+	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
-	"k8s.io/api/core/v1"
-	"k8s.io/api/extensions/v1beta1"
+
+	pkgTest "github.com/knative/pkg/test"
+	"github.com/knative/serving/pkg/apis/autoscaling"
+	resourcenames "github.com/knative/serving/pkg/reconciler/revision/resources/names"
+	rtesting "github.com/knative/serving/pkg/testing/v1alpha1"
+	"github.com/knative/serving/test"
+	"github.com/knative/pkg/test/logstream"
+	v1a1test "github.com/knative/serving/test/v1alpha1"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
 	autoscaleExpectedOutput = "399989"
+	// Concurrency must be high enough to avoid the problems with sampling
+	// but not high enough to generate scheduling problems.
+	containerConcurrency = 6
 )
 
-var (
-	stableWindow     time.Duration
-	scaleToZeroGrace time.Duration
-)
-
-func isDeploymentScaledUp() func(d *v1beta1.Deployment) (bool, error) {
-	return func(d *v1beta1.Deployment) (bool, error) {
+func isDeploymentScaledUp() func(d *appsv1.Deployment) (bool, error) {
+	return func(d *appsv1.Deployment) (bool, error) {
 		return d.Status.ReadyReplicas > 1, nil
 	}
 }
 
-func isDeploymentScaledToZero() func(d *v1beta1.Deployment) (bool, error) {
-	return func(d *v1beta1.Deployment) (bool, error) {
-		return d.Status.ReadyReplicas == 0, nil
-	}
-}
-
-func tearDown(ctx *testContext) {
-	TearDown(ctx.clients, ctx.names, ctx.logger)
-}
-
-func generateTraffic(ctx *testContext, concurrency int, duration time.Duration) error {
+func generateTraffic(ctx *testContext, concurrency int, duration time.Duration, stopChan chan struct{}) error {
 	var (
-		totalRequests      int
-		successfulRequests int
-		mux                sync.Mutex
+		totalRequests      int32
+		successfulRequests int32
 		group              errgroup.Group
 	)
 
-	ctx.logger.Infof("Maintaining %d concurrent requests for %v.", concurrency, duration)
+	ctx.t.Logf("Maintaining %d concurrent requests for %v.", concurrency, duration)
+	client, err := pkgTest.NewSpoofingClient(ctx.clients.KubeClient, ctx.t.Logf, ctx.domain, test.ServingFlags.ResolvableDomain)
+	if err != nil {
+		return fmt.Errorf("error creating spoofing client: %v", err)
+	}
 	for i := 0; i < concurrency; i++ {
 		group.Go(func() error {
+			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s?sleep=100", ctx.domain), nil)
+			if err != nil {
+				return fmt.Errorf("error creating HTTP request: %v", err)
+			}
 			done := time.After(duration)
-			client, err := pkgTest.NewSpoofingClient(ctx.clients.KubeClient, ctx.logger, ctx.domain, test.ServingFlags.ResolvableDomain)
-			if err != nil {
-				return fmt.Errorf("error creating spoofing client: %v", err)
-			}
-			req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s", ctx.domain), nil)
-			if err != nil {
-				return fmt.Errorf("error creating spoofing client: %v", err)
-			}
 			for {
 				select {
+				case <-stopChan:
+					ctx.t.Log("Stopping generateTraffic")
+					return nil
 				case <-done:
+					ctx.t.Log("Time is up; done")
 					return nil
 				default:
-					mux.Lock()
-					requestID := totalRequests + 1
-					totalRequests = requestID
-					mux.Unlock()
-					start := time.Now()
+					atomic.AddInt32(&totalRequests, 1)
 					res, err := client.Do(req)
 					if err != nil {
-						ctx.logger.Infof("error making request %v", err)
+						ctx.t.Logf("Error making request %v", err)
 						continue
 					}
-					duration := time.Now().Sub(start)
-					ctx.logger.Infof("Request took: %v", duration)
 
 					if res.StatusCode != http.StatusOK {
-						ctx.logger.Infof("request %d failed", requestID)
-						ctx.logger.Infof("non 200 response %v", res.StatusCode)
-						ctx.logger.Infof("response headers: %v", res.Header)
-						ctx.logger.Infof("response body: %v", string(res.Body))
+						ctx.t.Logf("Status = %d, want: %d", res.StatusCode, http.StatusOK)
+						ctx.t.Logf("Response: %s", res)
 						continue
 					}
-					mux.Lock()
-					successfulRequests++
-					mux.Unlock()
+					atomic.AddInt32(&successfulRequests, 1)
 				}
 			}
 		})
 	}
 
-	ctx.logger.Infof("Waiting for all requests to complete.")
+	ctx.t.Log("Waiting for all requests to complete.")
 	if err := group.Wait(); err != nil {
-		return fmt.Errorf("Error making requests for scale up: %v.", err)
+		return fmt.Errorf("error making requests for scale up: %v", err)
 	}
 
 	if successfulRequests != totalRequests {
-		return fmt.Errorf("Error making requests for scale up. Got %d successful requests. Wanted %d.",
+		return fmt.Errorf("error making requests for scale up. Got %d successful requests, wanted: %d",
 			successfulRequests, totalRequests)
 	}
 	return nil
@@ -128,74 +119,48 @@ func generateTraffic(ctx *testContext, concurrency int, duration time.Duration) 
 type testContext struct {
 	t              *testing.T
 	clients        *test.Clients
-	logger         *logging.BaseLogger
 	names          test.ResourceNames
 	deploymentName string
 	domain         string
 }
 
-func setup(t *testing.T) *testContext {
-	//add test case specific name to its own logger
-	logger := logging.GetContextLogger(t.Name())
+func setup(t *testing.T, class string, metric string) *testContext {
 	clients := Setup(t)
 
-	configMap, err := test.GetConfigMap(clients.KubeClient).Get("config-autoscaler", metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Unable to get autoscaler config map: %v", err)
+	t.Log("Creating a new Route and Configuration")
+	names := test.ResourceNames{
+		Service: test.ObjectNameForTest(t),
+		Image:   "autoscale",
 	}
-	scaleToZeroGrace, err = time.ParseDuration(configMap.Data["scale-to-zero-grace-period"])
+	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
+	resources, err := v1a1test.CreateRunLatestServiceReady(t, clients, &names, &v1a1test.Options{
+		ContainerConcurrency: containerConcurrency,
+	}, rtesting.WithConfigAnnotations(map[string]string{
+		autoscaling.ClassAnnotationKey:  class,
+		autoscaling.MetricAnnotationKey: metric,
+	}), rtesting.WithResourceRequirements(corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
+		Requests: corev1.ResourceList{
+			corev1.ResourceMemory: resource.MustParse("300Mi"),
+		},
+	}),
+	)
 	if err != nil {
-		t.Fatalf("Unable to parse scale-to-zero-grace as duration: %v", err)
-	}
-	stableWindow, err = time.ParseDuration(configMap.Data["stable-window"])
-	if err != nil {
-		t.Fatalf("Unable to parse stable-window as duration: %v", err)
-	}
-
-	imagePath := test.ImagePath("autoscale")
-
-	logger.Infof("Creating a new Route and Configuration")
-	names, err := CreateRouteAndConfig(clients, logger, imagePath, &test.Options{
-		ContainerConcurrency: 10,
-	})
-	if err != nil {
-		t.Fatalf("Failed to create Route and Configuration: %v", err)
-	}
-	test.CleanupOnInterrupt(func() { TearDown(clients, names, logger) }, logger)
-
-	logger.Infof("When the Revision can have traffic routed to it, the Route is marked as Ready.")
-	err = test.WaitForRouteState(
-		clients.ServingClient,
-		names.Route,
-		test.IsRouteReady,
-		"RouteIsReady")
-	if err != nil {
-		t.Fatalf("The Route %s was not marked as Ready to serve traffic: %v", names.Route, err)
+		t.Fatalf("Failed to create initial Service: %v: %v", names.Service, err)
 	}
 
-	logger.Infof("Serves the expected data at the endpoint")
-	config, err := clients.ServingClient.Configs.Get(names.Config, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Configuration %s was not updated with the new revision: %v", names.Config, err)
-	}
-	names.Revision = config.Status.LatestCreatedRevisionName
-	deploymentName := names.Revision + "-deployment"
-	route, err := clients.ServingClient.Routes.Get(names.Route, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("Error fetching Route %s: %v", names.Route, err)
-	}
-	domain := route.Status.Domain
-
-	_, err = pkgTest.WaitForEndpointState(
+	domain := resources.Route.Status.URL.Host
+	if _, err := pkgTest.WaitForEndpointState(
 		clients.KubeClient,
-		logger,
+		t.Logf,
 		domain,
 		// Istio doesn't expose a status for us here: https://github.com/istio/istio/issues/6082
 		// TODO(tcnghia): Remove this when https://github.com/istio/istio/issues/882 is fixed.
-		pkgTest.Retrying(pkgTest.EventuallyMatchesBody(autoscaleExpectedOutput), http.StatusNotFound, http.StatusServiceUnavailable),
+		v1a1test.RetryingRouteInconsistency(pkgTest.MatchesAllOf(pkgTest.IsStatusOK, pkgTest.EventuallyMatchesBody(autoscaleExpectedOutput))),
 		"CheckingEndpointAfterUpdating",
-		test.ServingFlags.ResolvableDomain)
-	if err != nil {
+		test.ServingFlags.ResolvableDomain); err != nil {
 		t.Fatalf("The endpoint for Route %s at domain %s didn't serve the expected text \"%v\": %v",
 			names.Route, domain, autoscaleExpectedOutput, err)
 	}
@@ -203,138 +168,195 @@ func setup(t *testing.T) *testContext {
 	return &testContext{
 		t:              t,
 		clients:        clients,
-		logger:         logger,
 		names:          names,
-		deploymentName: deploymentName,
+		deploymentName: resourcenames.Deployment(resources.Revision),
 		domain:         domain,
 	}
 }
 
 func assertScaleUp(ctx *testContext) {
-	ctx.logger.Infof("The autoscaler spins up additional replicas when traffic increases.")
-	err := generateTraffic(ctx, 20, 20*time.Second)
-	if err != nil {
+	ctx.t.Log("The autoscaler spins up additional replicas when traffic increases.")
+	if err := generateTraffic(ctx, 2*containerConcurrency, 20*time.Second, nil); err != nil {
 		ctx.t.Fatalf("Error during initial scale up: %v", err)
 	}
-	ctx.logger.Info("Waiting for scale up")
-	err = test.WaitForDeploymentState(
+	ctx.t.Logf("Waiting for scale up revision %s", ctx.names.Revision)
+	if err := pkgTest.WaitForDeploymentState(
 		ctx.clients.KubeClient,
 		ctx.deploymentName,
 		isDeploymentScaledUp(),
 		"DeploymentIsScaledUp",
-		2*time.Minute)
-	if err != nil {
+		test.ServingNamespace,
+		3*time.Minute); err != nil {
 		ctx.t.Fatalf("Unable to observe the Deployment named %s scaling up. %s", ctx.deploymentName, err)
 	}
 }
 
 func assertScaleDown(ctx *testContext) {
-	ctx.logger.Infof("The autoscaler successfully scales down when devoid of traffic.")
-
-	ctx.logger.Infof("Waiting for scale to zero")
-	err := test.WaitForDeploymentState(
-		ctx.clients.KubeClient,
-		ctx.deploymentName,
-		isDeploymentScaledToZero(),
-		"DeploymentScaledToZero",
-		scaleToZeroGrace+stableWindow+2*time.Minute)
-	if err != nil {
-		ctx.t.Fatalf("Unable to observe the Deployment named %s scaling down. %s", ctx.deploymentName, err)
+	if err := WaitForScaleToZero(ctx.t, ctx.deploymentName, ctx.clients); err != nil {
+		ctx.t.Fatalf("Unable to observe the Deployment named %s scaling down: %v", ctx.deploymentName, err)
 	}
 
 	// Account for the case where scaling up uses all available pods.
-	ctx.logger.Infof("Wait for all pods to terminate.")
+	ctx.t.Log("Wait for all pods to terminate.")
 
-	err = test.WaitForPodListState(
+	if err := pkgTest.WaitForPodListState(
 		ctx.clients.KubeClient,
 		func(p *v1.PodList) (bool, error) {
 			for _, pod := range p.Items {
-				if !strings.Contains(pod.Status.Reason, "Evicted") {
+				if strings.Contains(pod.Name, ctx.deploymentName) &&
+					!strings.Contains(pod.Status.Reason, "Evicted") {
 					return false, nil
 				}
 			}
 			return true, nil
 		},
-		"WaitForAvailablePods")
-	if err != nil {
-		ctx.t.Fatalf("Waiting for Pod.List to have no non-Evicted pods: %v", err)
+		"WaitForAvailablePods", test.ServingNamespace); err != nil {
+		ctx.t.Fatalf("Waiting for Pod.List to have no non-Evicted pods of %q: %v", ctx.deploymentName, err)
 	}
 
-	time.Sleep(10 * time.Second)
-	ctx.logger.Info("The Revision should remain ready after scaling to zero.")
-	if err := test.CheckRevisionState(ctx.clients.ServingClient, ctx.names.Revision, test.IsRevisionReady); err != nil {
+	ctx.t.Log("The Revision should remain ready after scaling to zero.")
+	if err := v1a1test.CheckRevisionState(ctx.clients.ServingAlphaClient, ctx.names.Revision, v1a1test.IsRevisionReady); err != nil {
 		ctx.t.Fatalf("The Revision %s did not stay Ready after scaling down to zero: %v", ctx.names.Revision, err)
 	}
 
-	ctx.logger.Infof("Scaled down.")
+	ctx.t.Log("Scaled down.")
+}
+
+func numberOfPods(ctx *testContext) (int32, error) {
+	deployment, err := ctx.clients.KubeClient.Kube.Apps().Deployments(test.ServingNamespace).Get(ctx.deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return 0, errors.Wrapf(err, "Failed to get deployment %q", deployment)
+	}
+	return deployment.Status.ReadyReplicas, nil
+}
+
+func assertAutoscaleUpToNumPods(ctx *testContext, curPods, targetPods int32, duration time.Duration, quick bool) {
+	// There are two test modes: quick, and not quick.
+	// 1) Quick mode: succeeds when the number of pods meets targetPods.
+	// 2) Not Quick (sustaining) mode: succeeds when the number of pods gets scaled to targetPods and
+	//    sustains there for the `duration`.
+
+	// Relax the bounds to reduce the flakiness caused by sampling in the autoscaling algorithm.
+	minPods := curPods - 1
+	maxPods := targetPods + 1
+
+	stopChan := make(chan struct{})
+	var grp errgroup.Group
+	grp.Go(func() error {
+		return generateTraffic(ctx, int(targetPods*containerConcurrency), duration, stopChan)
+	})
+	grp.Go(func() error {
+		// Short-circuit traffic generation once we exit from the check logic.
+		defer close(stopChan)
+
+		done := time.After(duration)
+		timer := time.Tick(2 * time.Second)
+		for {
+			select {
+			case <-timer:
+				// Each 2 second, check that the number of pods is at least `minPods`. `minPods` is increasing
+				// to verify that the number of pods doesn't go down while we are scaling up.
+				got, err := numberOfPods(ctx)
+				if err != nil {
+					return err
+				}
+				mes := fmt.Sprintf("deployment '%s' #replicas: %d, want at least: %d", ctx.deploymentName, got, minPods)
+				ctx.t.Log(mes)
+				if got < minPods {
+					return errors.New(mes)
+				}
+				if quick {
+					// A quick test succeeds when the number of pods scales up to `targetPods`
+					// (and, for sanity check, no more than `maxPods`).
+					if got >= targetPods && got <= maxPods {
+						return nil
+					}
+				}
+				if minPods < targetPods-1 {
+					// Increase `minPods`, but leave room to reduce flakiness.
+					minPods = int32(math.Min(float64(got), float64(targetPods))) - 1
+				}
+			case <-done:
+				// The test duration is over. Do a last check to verify that the number of pods is at `targetPods`
+				// (with a little room for de-flakiness).
+				got, err := numberOfPods(ctx)
+				if err != nil {
+					return err
+				}
+				mes := fmt.Sprintf("got %d replicas, expected between [%d, %d] replicas for deployment %s", got, targetPods-1, maxPods, ctx.deploymentName)
+				ctx.t.Log(mes)
+				if got < targetPods-1 || got > maxPods {
+					return errors.New(mes)
+				}
+				return nil
+			}
+		}
+	})
+
+	if err := grp.Wait(); err != nil {
+		ctx.t.Error(err)
+	}
 }
 
 func TestAutoscaleUpDownUp(t *testing.T) {
-	ctx := setup(t)
-	stopChan := DiagnoseMeEvery(15*time.Second, ctx.clients, ctx.logger)
-	defer close(stopChan)
-	defer tearDown(ctx)
+	t.Parallel()
+	cancel := logstream.Start(t)
+	defer cancel()
+
+	ctx := setup(t, autoscaling.KPA, autoscaling.Concurrency)
+	defer test.TearDown(ctx.clients, ctx.names)
+
+	sc := startDiagnosis(t, ctx.clients, 15*time.Second)
+	defer sc.stop()
 
 	assertScaleUp(ctx)
 	assertScaleDown(ctx)
 	assertScaleUp(ctx)
 }
 
-func assertNumberOfPodsEvery(duration time.Duration, ctx *testContext, numReplicasMin int32, numReplicasMax int32) chan struct{} {
-	stopChan := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-stopChan:
-				return
-			default:
-				assertNumberOfPods(ctx, numReplicasMin, numReplicasMax)
-				time.Sleep(duration)
-			}
-		}
-	}()
-	return stopChan
-}
-
-func assertNumberOfPods(ctx *testContext, numReplicasMin int32, numReplicasMax int32) {
-	deployment, err := ctx.clients.KubeClient.Kube.ExtensionsV1beta1().Deployments("serving-tests").Get(ctx.deploymentName, metav1.GetOptions{})
-	if err != nil {
-		ctx.t.Fatalf("Failed to get deployment %s: %v", deployment, err)
-	}
-	gotReplicas := deployment.Status.Replicas
-	ctx.logger.Infof("Assert wanted replicas %d of deployment %s is between %d and %d replicas ", gotReplicas, ctx.deploymentName, numReplicasMin, numReplicasMax)
-	if gotReplicas < numReplicasMin || gotReplicas > numReplicasMax {
-		ctx.t.Fatalf("Unable to observe the Deployment named %s has scaled to %d-%d pods, observed %d Replicas.", ctx.deploymentName, numReplicasMin, numReplicasMax, gotReplicas)
-	}
-}
-
-func assertAutoscaleUpToNumPods(ctx *testContext, numPods int32) {
-	stopChan := assertNumberOfPodsEvery(2*time.Second, ctx, numPods-1, numPods+1)
-	defer close(stopChan)
-
-	if err := generateTraffic(ctx, int(numPods*10), 30*time.Second); err != nil {
-		ctx.t.Fatalf("Error during initial scale up: %v", err)
-	}
-	// Relaxing the pod count requirement a little bit to avoid being too flaky.
-	minPods := numPods - 1
-	maxPods := numPods + 1
-	assertNumberOfPods(ctx, minPods, maxPods)
-}
-
 func TestAutoscaleUpCountPods(t *testing.T) {
-	ctx := setup(t)
-	defer tearDown(ctx)
+	t.Parallel()
 
-	ctx.logger.Infof("The autoscaler spins up additional replicas when traffic increases.")
-	// note: without the warm-up / gradual increase of load the test is retrieving a 503 (overload) from the envoy
+	classes := map[string]string{
+		"hpa": autoscaling.HPA,
+		"kpa": autoscaling.KPA,
+	}
 
-	// increase workload for 2 replicas for 30s
-	// assert the number of wanted replicas is between 1-3 during the 30s
-	// assert the number of wanted replicas is 2-3 after 30s
-	assertAutoscaleUpToNumPods(ctx, 2)
-	// scale to 3 replicas, assert 2-4 during scale up, assert 3-4 after scaleup
-	assertAutoscaleUpToNumPods(ctx, 3)
-	// scale to 4 replicas, assert 3-5 during scale up, assert 4-5 after scaleup
-	assertAutoscaleUpToNumPods(ctx, 4)
+	for name, class := range classes {
+		name, class := name, class
+		t.Run(name, func(tt *testing.T) {
+			tt.Parallel()
+			cancel := logstream.Start(t)
+			defer cancel()
 
+			ctx := setup(tt, class, autoscaling.Concurrency)
+			defer test.TearDown(ctx.clients, ctx.names)
+
+			ctx.t.Log("The autoscaler spins up additional replicas when traffic increases.")
+			// note: without the warm-up / gradual increase of load the test is retrieving a 503 (overload) from the envoy
+
+			// Increase workload for 2 replicas for 60s
+			// Assert the number of expected replicas is between n-1 and n+1, where n is the # of desired replicas for 60s.
+			// Assert the number of expected replicas is n and n+1 at the end of 60s, where n is the # of desired replicas.
+			assertAutoscaleUpToNumPods(ctx, 1, 2, 60*time.Second, true)
+			// Increase workload scale to 3 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
+			assertAutoscaleUpToNumPods(ctx, 2, 3, 60*time.Second, true)
+			// Increase workload scale to 4 replicas, assert between [n-1, n+1] during scale up, assert between [n, n+1] after scaleup.
+			assertAutoscaleUpToNumPods(ctx, 3, 4, 60*time.Second, true)
+		})
+	}
+}
+
+func TestAutoscaleSustaining(t *testing.T) {
+	// When traffic increases, a knative app should scale up and sustain the scale
+	// as long as the traffic sustains, despite whether it is switching modes between
+	// normal and panic.
+	t.Parallel()
+	cancel := logstream.Start(t)
+	defer cancel()
+
+	ctx := setup(t, autoscaling.KPA, autoscaling.Concurrency)
+	defer test.TearDown(ctx.clients, ctx.names)
+
+	assertAutoscaleUpToNumPods(ctx, 1, 10, 3*time.Minute, false)
 }

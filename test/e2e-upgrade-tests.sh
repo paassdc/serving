@@ -25,7 +25,7 @@
 # project $PROJECT_ID, start knative in it, run the tests and delete the
 # cluster.
 
-source $(dirname $0)/cluster.sh
+source $(dirname $0)/e2e-common.sh
 
 # Latest serving release. This is intentionally hardcoded so that we can test
 # upgrade/downgrade on release branches (or even arbitrary commits).
@@ -37,50 +37,66 @@ source $(dirname $0)/cluster.sh
 # version will make tests either:
 # 1. Still pass, meaning we can upgrade from earlier than latest release (good).
 # 2. Fail, which might be remedied by bumping this version.
-readonly LATEST_SERVING_RELEASE_VERSION=0.2.2
+readonly LATEST_SERVING_RELEASE_VERSION=0.6.0
 
 function install_latest_release() {
   header "Installing Knative latest public release"
   local url="https://github.com/knative/serving/releases/download/v${LATEST_SERVING_RELEASE_VERSION}"
+  # TODO: should this test install istio and build at all, or only serving?
   install_knative_serving \
-    "${url}/istio-crds.yaml" \
-    "${url}/istio.yaml" \
-    "${url}/release-no-mon.yaml" \
+    "${url}/serving.yaml" \
     || fail_test "Knative latest release installation failed"
+  wait_until_pods_running knative-serving
 }
 
 function install_head() {
   header "Installing Knative head release"
   install_knative_serving || fail_test "Knative head release installation failed"
+  wait_until_pods_running knative-serving
 }
 
-# Deletes everything created on the cluster including all knative and istio components.
-function teardown() {
-  uninstall_knative_serving
+function knative_setup() {
+  # Build Knative to generate Istio manifests from HEAD for install_latest_release
+  # We do it here because it's a one-time setup
+  build_knative_from_source
+  install_latest_release
 }
 
 # Script entry point.
 
-initialize $@
-
-header "Setting up environment"
-publish_test_images
-
-install_latest_release
+initialize $@ --skip-istio-addon
 
 # TODO(#2656): Reduce the timeout after we get this test to consistently passing.
 TIMEOUT=10m
+
 header "Running preupgrade tests"
-go_test_e2e -tags=preupgrade -timeout=$TIMEOUT ./test/upgrade || fail_test
+
+go_test_e2e -tags=preupgrade -timeout=${TIMEOUT} ./test/upgrade \
+  --resolvabledomain=$(use_resolvable_domain) || fail_test
+
+header "Starting prober test"
+
+# Remove this in case we failed to clean it up in an earlier test.
+rm -f /tmp/prober-signal
+
+go_test_e2e -tags=probe -timeout=${TIMEOUT} ./test/upgrade \
+  --resolvabledomain=$(use_resolvable_domain) &
+PROBER_PID=$!
+echo "Prober PID is ${PROBER_PID}"
 
 install_head
 
 header "Running postupgrade tests"
-go_test_e2e -tags=postupgrade -timeout=$TIMEOUT ./test/upgrade || fail_test
+go_test_e2e -tags=postupgrade -timeout=${TIMEOUT} ./test/upgrade \
+  --resolvabledomain=$(use_resolvable_domain) || fail_test
 
-install_latest_release
+# The prober is blocking on /tmp/prober-signal to know when it should exit.
+#
+# This is kind of gross. First attempt was to just send a signal to the go test,
+# but "go test" intercepts the signal and always exits with a non-zero code.
+echo "done" > /tmp/prober-signal
 
-header "Running postdowngrade tests"
-go_test_e2e -tags=postdowngrade -timeout=$TIMEOUT ./test/upgrade || fail_test
+header "Waiting for prober test"
+wait ${PROBER_PID} || fail_test "Prober failed"
 
 success

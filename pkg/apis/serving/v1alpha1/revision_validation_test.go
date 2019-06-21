@@ -17,235 +17,25 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/knative/pkg/apis"
+	logtesting "github.com/knative/pkg/logging/testing"
+	"github.com/knative/pkg/ptr"
 	"github.com/knative/serving/pkg/apis/autoscaling"
-	netv1alpha1 "github.com/knative/serving/pkg/apis/networking/v1alpha1"
+	"github.com/knative/serving/pkg/apis/config"
+	net "github.com/knative/serving/pkg/apis/networking"
+	"github.com/knative/serving/pkg/apis/serving"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"github.com/knative/pkg/apis"
+	"github.com/knative/serving/pkg/apis/serving/v1beta1"
 )
-
-func TestContainerValidation(t *testing.T) {
-	tests := []struct {
-		name string
-		c    corev1.Container
-		want *apis.FieldError
-	}{{
-		name: "empty container",
-		c:    corev1.Container{},
-		want: apis.ErrMissingField(apis.CurrentField),
-	}, {
-		name: "valid container",
-		c: corev1.Container{
-			Image: "foo",
-		},
-		want: nil,
-	}, {
-		name: "has a name",
-		c: corev1.Container{
-			Name: "foo",
-		},
-		want: apis.ErrDisallowedFields("name"),
-	}, {
-		name: "has resources",
-		c: corev1.Container{
-			Resources: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{
-					corev1.ResourceName("cpu"): resource.MustParse("25m"),
-				},
-			},
-		},
-		want: nil,
-	}, {
-		name: "has ports",
-		c: corev1.Container{
-			Ports: []corev1.ContainerPort{{
-				Name:          "http",
-				ContainerPort: 8080,
-			}},
-		},
-		want: apis.ErrDisallowedFields("ports"),
-	}, {
-		name: "has volumeMounts",
-		c: corev1.Container{
-			VolumeMounts: []corev1.VolumeMount{{
-				MountPath: "mount/path",
-				Name:      "name",
-			}},
-		},
-		want: apis.ErrDisallowedFields("volumeMounts"),
-	}, {
-		name: "has lifecycle",
-		c: corev1.Container{
-			Lifecycle: &corev1.Lifecycle{},
-		},
-		want: apis.ErrDisallowedFields("lifecycle"),
-	}, {
-		name: "valid with probes (no port)",
-		c: corev1.Container{
-			Image: "foo",
-			ReadinessProbe: &corev1.Probe{
-				Handler: corev1.Handler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: "/",
-					},
-				},
-			},
-			LivenessProbe: &corev1.Probe{
-				Handler: corev1.Handler{
-					TCPSocket: &corev1.TCPSocketAction{},
-				},
-			},
-		},
-		want: nil,
-	}, {
-		name: "invalid readiness http probe (has port)",
-		c: corev1.Container{
-			Image: "foo",
-			ReadinessProbe: &corev1.Probe{
-				Handler: corev1.Handler{
-					HTTPGet: &corev1.HTTPGetAction{
-						Path: "/",
-						Port: intstr.FromInt(8080),
-					},
-				},
-			},
-		},
-		want: apis.ErrDisallowedFields("readinessProbe.httpGet.port"),
-	}, {
-		name: "invalid liveness tcp probe (has port)",
-		c: corev1.Container{
-			Image: "foo",
-			LivenessProbe: &corev1.Probe{
-				Handler: corev1.Handler{
-					TCPSocket: &corev1.TCPSocketAction{
-						Port: intstr.FromString("http"),
-					},
-				},
-			},
-		},
-		want: apis.ErrDisallowedFields("livenessProbe.tcpSocket.port"),
-	}, {
-		name: "has numerous problems",
-		c: corev1.Container{
-			Name: "foo",
-			Ports: []corev1.ContainerPort{{
-				Name:          "http",
-				ContainerPort: 8080,
-			}},
-			VolumeMounts: []corev1.VolumeMount{{
-				MountPath: "mount/path",
-				Name:      "name",
-			}},
-			Lifecycle: &corev1.Lifecycle{},
-		},
-		want: apis.ErrDisallowedFields("name", "ports", "volumeMounts", "lifecycle"),
-	}}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := validateContainer(test.c)
-			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
-				t.Errorf("validateContainer (-want, +got) = %v", diff)
-			}
-		})
-	}
-}
-
-func TestBuildRefValidation(t *testing.T) {
-	tests := []struct {
-		name string
-		r    *corev1.ObjectReference
-		want *apis.FieldError
-	}{{
-		name: "nil",
-	}, {
-		name: "no api version",
-		r:    &corev1.ObjectReference{},
-		want: apis.ErrInvalidValue("", "apiVersion"),
-	}, {
-		name: "bad api version",
-		r: &corev1.ObjectReference{
-			APIVersion: "/v1alpha1",
-		},
-		want: apis.ErrInvalidValue("/v1alpha1", "apiVersion"),
-	}, {
-		name: "no kind",
-		r: &corev1.ObjectReference{
-			APIVersion: "foo/v1alpha1",
-		},
-		want: apis.ErrInvalidValue("", "kind"),
-	}, {
-		name: "bad kind",
-		r: &corev1.ObjectReference{
-			APIVersion: "foo/v1alpha1",
-			Kind:       "Bad Kind",
-		},
-		want: apis.ErrInvalidValue("Bad Kind", "kind"),
-	}, {
-		name: "no namespace",
-		r: &corev1.ObjectReference{
-			APIVersion: "foo.group/v1alpha1",
-			Kind:       "Bar",
-			Name:       "the-bar-0001",
-		},
-		want: nil,
-	}, {
-		name: "no name",
-		r: &corev1.ObjectReference{
-			APIVersion: "foo.group/v1alpha1",
-			Kind:       "Bar",
-		},
-		want: apis.ErrInvalidValue("", "name"),
-	}, {
-		name: "bad name",
-		r: &corev1.ObjectReference{
-			APIVersion: "foo.group/v1alpha1",
-			Kind:       "Bar",
-			Name:       "bad name",
-		},
-		want: apis.ErrInvalidValue("bad name", "name"),
-	}, {
-		name: "disallowed fields",
-		r: &corev1.ObjectReference{
-			APIVersion: "foo.group/v1alpha1",
-			Kind:       "Bar",
-			Name:       "bar0001",
-
-			Namespace:       "foo",
-			FieldPath:       "some.field.path",
-			ResourceVersion: "234234",
-			UID:             "deadbeefcafebabe",
-		},
-		want: apis.ErrDisallowedFields("namespace", "fieldPath", "resourceVersion", "uid"),
-	}, {
-		name: "all good",
-		r: &corev1.ObjectReference{
-			APIVersion: "foo.group/v1alpha1",
-			Kind:       "Bar",
-			Name:       "bar0001",
-		},
-		want: nil,
-	}}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := validateBuildRef(test.r)
-			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
-				t.Errorf("validateBuildRef (-want, +got) = %v", diff)
-			}
-		})
-	}
-}
 
 func TestConcurrencyModelValidation(t *testing.T) {
 	tests := []struct {
@@ -276,63 +66,7 @@ func TestConcurrencyModelValidation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.cm.Validate()
-			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
-				t.Errorf("Validate (-want, +got) = %v", diff)
-			}
-		})
-	}
-}
-
-func TestContainerConcurrencyValidation(t *testing.T) {
-	tests := []struct {
-		name string
-		cc   RevisionContainerConcurrencyType
-		cm   RevisionRequestConcurrencyModelType
-		want *apis.FieldError
-	}{{
-		name: "single with only container concurrency",
-		cc:   1,
-		cm:   RevisionRequestConcurrencyModelType(""),
-		want: nil,
-	}, {
-		name: "single with container currency and concurrency model",
-		cc:   1,
-		cm:   RevisionRequestConcurrencyModelSingle,
-		want: nil,
-	}, {
-		name: "multi with only container concurrency",
-		cc:   0,
-		cm:   RevisionRequestConcurrencyModelType(""),
-		want: nil,
-	}, {
-		name: "multi with container concurrency and concurrency model",
-		cc:   0,
-		cm:   RevisionRequestConcurrencyModelMulti,
-		want: nil,
-	}, {
-		name: "mismatching container concurrency (1) and concurrency model (multi)",
-		cc:   1,
-		cm:   RevisionRequestConcurrencyModelMulti,
-		want: apis.ErrMultipleOneOf("containerConcurrency", "concurrencyModel"),
-	}, {
-		name: "mismatching container concurrency (0) and concurrency model (single)",
-		cc:   0,
-		cm:   RevisionRequestConcurrencyModelSingle,
-		want: apis.ErrMultipleOneOf("containerConcurrency", "concurrencyModel"),
-	}, {
-		name: "invalid container concurrency (too small)",
-		cc:   -1,
-		want: apis.ErrInvalidValue("-1", "containerConcurrency"),
-	}, {
-		name: "invalid container concurrency (too large)",
-		cc:   RevisionContainerConcurrencyMax + 1,
-		want: apis.ErrInvalidValue(strconv.Itoa(int(RevisionContainerConcurrencyMax)+1), "containerConcurrency"),
-	}}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := ValidateContainerConcurrency(test.cc, test.cm)
+			got := test.cm.Validate(context.Background())
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
@@ -344,70 +78,202 @@ func TestRevisionSpecValidation(t *testing.T) {
 	tests := []struct {
 		name string
 		rs   *RevisionSpec
+		wc   func(context.Context) context.Context
 		want *apis.FieldError
 	}{{
 		name: "valid",
 		rs: &RevisionSpec{
-			Container: corev1.Container{
+			DeprecatedContainer: &corev1.Container{
 				Image: "helloworld",
 			},
-			ConcurrencyModel: "Multi",
 		},
 		want: nil,
 	}, {
-		name: "has bad build ref",
+		name: "invalid deprecated fields",
+		wc:   apis.DisallowDeprecated,
 		rs: &RevisionSpec{
-			Container: corev1.Container{
+			DeprecatedGeneration:   123,
+			DeprecatedServingState: "Active",
+			DeprecatedContainer: &corev1.Container{
 				Image: "helloworld",
 			},
-			BuildRef: &corev1.ObjectReference{},
+			DeprecatedConcurrencyModel: "Multi",
+			DeprecatedBuildName:        "banana",
 		},
-		want: apis.ErrInvalidValue("", "buildRef.apiVersion"),
+		want: apis.ErrDisallowedFields("buildName", "concurrencyModel", "container",
+			"generation", "servingState"),
+	}, {
+		name: "missing container",
+		rs: &RevisionSpec{
+			RevisionSpec: v1beta1.RevisionSpec{
+				PodSpec: corev1.PodSpec{
+					Volumes: []corev1.Volume{{
+						Name: "the-name",
+						VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{
+								SecretName: "foo",
+							},
+						},
+					}},
+				},
+			},
+		},
+		want: apis.ErrMissingOneOf("container", "containers"),
+	}, {
+		name: "with volume (ok)",
+		rs: &RevisionSpec{
+			DeprecatedContainer: &corev1.Container{
+				Image: "helloworld",
+				VolumeMounts: []corev1.VolumeMount{{
+					MountPath: "/mount/path",
+					Name:      "the-name",
+					ReadOnly:  true,
+				}},
+			},
+			RevisionSpec: v1beta1.RevisionSpec{
+				PodSpec: corev1.PodSpec{
+					Volumes: []corev1.Volume{{
+						Name: "the-name",
+						VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{
+								SecretName: "foo",
+							},
+						},
+					}},
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "with volume name collision",
+		rs: &RevisionSpec{
+			DeprecatedContainer: &corev1.Container{
+				Image: "helloworld",
+				VolumeMounts: []corev1.VolumeMount{{
+					MountPath: "/mount/path",
+					Name:      "the-name",
+					ReadOnly:  true,
+				}},
+			},
+			RevisionSpec: v1beta1.RevisionSpec{
+				PodSpec: corev1.PodSpec{
+					Volumes: []corev1.Volume{{
+						Name: "the-name",
+						VolumeSource: corev1.VolumeSource{
+							Secret: &corev1.SecretVolumeSource{
+								SecretName: "foo",
+							},
+						},
+					}, {
+						Name: "the-name",
+						VolumeSource: corev1.VolumeSource{
+							ConfigMap: &corev1.ConfigMapVolumeSource{},
+						},
+					}},
+				},
+			},
+		},
+		want: (&apis.FieldError{
+			Message: fmt.Sprintf(`duplicate volume name "the-name"`),
+			Paths:   []string{"name"},
+		}).ViaFieldIndex("volumes", 1),
+	}, {
+		name: "has build ref (disallowed)",
+		rs: &RevisionSpec{
+			DeprecatedContainer: &corev1.Container{
+				Image: "helloworld",
+			},
+			DeprecatedBuildRef: &corev1.ObjectReference{},
+		},
+		want: apis.ErrDisallowedFields("buildRef"),
 	}, {
 		name: "bad concurrency model",
 		rs: &RevisionSpec{
-			Container: corev1.Container{
+			DeprecatedContainer: &corev1.Container{
 				Image: "helloworld",
 			},
-			ConcurrencyModel: "bogus",
+			DeprecatedConcurrencyModel: "bogus",
 		},
 		want: apis.ErrInvalidValue("bogus", "concurrencyModel"),
 	}, {
 		name: "bad container spec",
 		rs: &RevisionSpec{
-			Container: corev1.Container{
-				Name:  "steve",
-				Image: "helloworld",
+			DeprecatedContainer: &corev1.Container{
+				Name:      "steve",
+				Image:     "helloworld",
+				Lifecycle: &corev1.Lifecycle{},
 			},
 		},
-		want: apis.ErrDisallowedFields("container.name"),
+		want: apis.ErrDisallowedFields("container.lifecycle"),
 	}, {
 		name: "exceed max timeout",
 		rs: &RevisionSpec{
-			Container: corev1.Container{
+			DeprecatedContainer: &corev1.Container{
 				Image: "helloworld",
 			},
-			TimeoutSeconds: &metav1.Duration{
-				Duration: 600 * time.Second,
+			RevisionSpec: v1beta1.RevisionSpec{
+				TimeoutSeconds: ptr.Int64(6000),
 			},
 		},
-		want: apis.ErrOutOfBoundsValue("10m0s", "0s", netv1alpha1.DefaultTimeout.String(), "timeoutSeconds"),
+		want: apis.ErrOutOfBoundsValue(6000, 0,
+			config.DefaultMaxRevisionTimeoutSeconds,
+			"timeoutSeconds"),
+	}, {
+		name: "exceed custom max timeout",
+		rs: &RevisionSpec{
+			DeprecatedContainer: &corev1.Container{
+				Image: "helloworld",
+			},
+			RevisionSpec: v1beta1.RevisionSpec{
+				TimeoutSeconds: ptr.Int64(100),
+			},
+		},
+		wc: func(ctx context.Context) context.Context {
+			s := config.NewStore(logtesting.TestLogger(t))
+			s.OnConfigChanged(&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: config.DefaultsConfigName,
+				},
+				Data: map[string]string{
+					"revision-timeout-seconds":     "25",
+					"max-revision-timeout-seconds": "50"},
+			})
+			return s.ToContext(ctx)
+		},
+		want: apis.ErrOutOfBoundsValue(100, 0, 50, "timeoutSeconds"),
+	}, {
+		name: "provided zero timeout (ok)",
+		rs: &RevisionSpec{
+			DeprecatedContainer: &corev1.Container{
+				Image: "helloworld",
+			},
+			RevisionSpec: v1beta1.RevisionSpec{
+				TimeoutSeconds: ptr.Int64(0),
+			},
+		},
+		want: nil,
 	}, {
 		name: "negative timeout",
 		rs: &RevisionSpec{
-			Container: corev1.Container{
+			DeprecatedContainer: &corev1.Container{
 				Image: "helloworld",
 			},
-			TimeoutSeconds: &metav1.Duration{
-				Duration: -30 * time.Second,
+			RevisionSpec: v1beta1.RevisionSpec{
+				TimeoutSeconds: ptr.Int64(-30),
 			},
 		},
-		want: apis.ErrOutOfBoundsValue("-30s", "0s", netv1alpha1.DefaultTimeout.String(), "timeoutSeconds"),
+		want: apis.ErrOutOfBoundsValue(-30, 0,
+			config.DefaultMaxRevisionTimeoutSeconds,
+			"timeoutSeconds"),
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.rs.Validate()
+			ctx := context.Background()
+			if test.wc != nil {
+				ctx = test.wc(ctx)
+			}
+			got := test.rs.Validate(ctx)
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
@@ -424,10 +290,9 @@ func TestRevisionTemplateSpecValidation(t *testing.T) {
 		name: "valid",
 		rts: &RevisionTemplateSpec{
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		want: nil,
@@ -439,19 +304,73 @@ func TestRevisionTemplateSpecValidation(t *testing.T) {
 		name: "nested spec error",
 		rts: &RevisionTemplateSpec{
 			Spec: RevisionSpec{
-				Container: corev1.Container{
-					Name:  "kevin",
-					Image: "helloworld",
+				DeprecatedContainer: &corev1.Container{
+					Name:      "kevin",
+					Image:     "helloworld",
+					Lifecycle: &corev1.Lifecycle{},
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
-		want: apis.ErrDisallowedFields("spec.container.name"),
+		want: apis.ErrDisallowedFields("spec.container.lifecycle"),
+	}, {
+		name: "has revision template name",
+		rts: &RevisionTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				// We let users bring their own revision name.
+				Name: "parent-foo",
+			},
+			Spec: RevisionSpec{
+				DeprecatedContainer: &corev1.Container{
+					Image: "helloworld",
+				},
+			},
+		},
+		want: nil,
+	}, {
+		name: "Queue sidecar resource percentage annotation more than 100",
+		rts: &RevisionTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					serving.QueueSideCarResourcePercentageAnnotation: "200",
+				},
+			},
+			Spec: RevisionSpec{
+				DeprecatedContainer: &corev1.Container{
+					Image: "helloworld",
+				},
+			},
+		},
+		want: &apis.FieldError{
+			Message: "expected 0.1 <= 200 <= 100",
+			Paths:   []string{serving.QueueSideCarResourcePercentageAnnotation},
+		},
+	}, {
+		name: "Invalid queue sidecar resource percentage annotation",
+		rts: &RevisionTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{
+				Annotations: map[string]string{
+					serving.QueueSideCarResourcePercentageAnnotation: "50mx",
+				},
+			},
+			Spec: RevisionSpec{
+				DeprecatedContainer: &corev1.Container{
+					Image: "helloworld",
+				},
+			},
+		},
+		want: &apis.FieldError{
+			Message: "invalid value: 50mx",
+			Paths:   []string{fmt.Sprintf("[%s]", serving.QueueSideCarResourcePercentageAnnotation)},
+		},
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.rts.Validate()
+			ctx := apis.WithinParent(context.Background(), metav1.ObjectMeta{
+				Name: "parent",
+			})
+
+			got := test.rts.Validate(ctx)
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
@@ -467,44 +386,55 @@ func TestRevisionValidation(t *testing.T) {
 	}{{
 		name: "valid",
 		r: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		want: nil,
 	}, {
 		name: "empty spec",
-		r:    &Revision{},
+		r: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
+		},
 		want: apis.ErrMissingField("spec"),
 	}, {
 		name: "nested spec error",
 		r: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "valid",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
-					Name:  "kevin",
-					Image: "helloworld",
+				DeprecatedContainer: &corev1.Container{
+					Name:      "kevin",
+					Image:     "helloworld",
+					Lifecycle: &corev1.Lifecycle{},
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
-		want: apis.ErrDisallowedFields("spec.container.name"),
+		want: apis.ErrDisallowedFields("spec.container.lifecycle"),
 	}, {
-		name: "invalid name - dots",
+		name: "invalid name - dots and too long",
 		r: &Revision{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "do.not.use.dots",
+				Name: "a" + strings.Repeat(".", 62) + "a",
 			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
-		want: &apis.FieldError{Message: "Invalid resource name: special character . must not be present", Paths: []string{"metadata.name"}},
+		want: &apis.FieldError{
+			Message: "not a DNS 1035 label: [must be no more than 63 characters a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character (e.g. 'my-name',  or 'abc-123', regex used for validation is '[a-z]([-a-z0-9]*[a-z0-9])?')]",
+			Paths:   []string{"metadata.name"},
+		},
 	}, {
 		name: "invalid metadata.annotations - scale bounds",
 		r: &Revision{
@@ -516,35 +446,20 @@ func TestRevisionValidation(t *testing.T) {
 				},
 			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		want: (&apis.FieldError{
 			Message: fmt.Sprintf("%s=%v is less than %s=%v", autoscaling.MaxScaleAnnotationKey, 2, autoscaling.MinScaleAnnotationKey, 5),
 			Paths:   []string{autoscaling.MaxScaleAnnotationKey, autoscaling.MinScaleAnnotationKey},
 		}).ViaField("annotations").ViaField("metadata"),
-	}, {
-		name: "invalid name - too long",
-		r: &Revision{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: strings.Repeat("a", 65),
-			},
-			Spec: RevisionSpec{
-				Container: corev1.Container{
-					Image: "helloworld",
-				},
-				ConcurrencyModel: "Multi",
-			},
-		},
-		want: &apis.FieldError{Message: "Invalid resource name: length must be no more than 63 characters", Paths: []string{"metadata.name"}},
 	}}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.r.Validate()
+			got := test.r.Validate(context.Background())
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
@@ -552,105 +467,146 @@ func TestRevisionValidation(t *testing.T) {
 	}
 }
 
-type notARevision struct{}
-
-func (nar *notARevision) CheckImmutableFields(apis.Immutable) *apis.FieldError {
-	return nil
-}
-
 func TestImmutableFields(t *testing.T) {
 	tests := []struct {
 		name string
-		new  apis.Immutable
-		old  apis.Immutable
+		new  *Revision
+		old  *Revision
+		wc   func(context.Context) context.Context
 		want *apis.FieldError
 	}{{
 		name: "good (no change)",
 		new: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		old: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		want: nil,
 	}, {
-		name: "bad (type mismatch)",
+		// Test the case where max-revision-timeout is changed to a value
+		// that is less than an existing revision's timeout value.
+		// Existing revision should keep operating normally.
+		name: "good (max revision timeout change)",
 		new: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
+				RevisionSpec: v1beta1.RevisionSpec{
+					TimeoutSeconds: ptr.Int64(100),
+				},
 			},
 		},
-		old:  &notARevision{},
-		want: &apis.FieldError{Message: "The provided original was not a Revision"},
+		old: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
+			Spec: RevisionSpec{
+				DeprecatedContainer: &corev1.Container{
+					Image: "helloworld",
+				},
+				RevisionSpec: v1beta1.RevisionSpec{
+					TimeoutSeconds: ptr.Int64(100),
+				},
+			},
+		},
+		wc: func(ctx context.Context) context.Context {
+			s := config.NewStore(logtesting.TestLogger(t))
+			s.OnConfigChanged(&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: config.DefaultsConfigName,
+				},
+				Data: map[string]string{
+					"revision-timeout-seconds":     "25",
+					"max-revision-timeout-seconds": "50"},
+			})
+			return s.ToContext(ctx)
+		},
+		want: nil,
 	}, {
 		name: "bad (resources image change)",
 		new: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
+					Image: "busybox",
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceName("cpu"): resource.MustParse("50m"),
 						},
 					},
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		old: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
+					Image: "busybox",
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceName("cpu"): resource.MustParse("100m"),
 						},
 					},
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		want: &apis.FieldError{
 			Message: "Immutable fields changed (-old +new)",
 			Paths:   []string{"spec"},
-			Details: `{v1alpha1.RevisionSpec}.Container.Resources.Requests["cpu"]:
-	-: resource.Quantity{i: resource.int64Amount{value: 100, scale: resource.Scale(-3)}, s: "100m", Format: resource.Format("DecimalSI")}
-	+: resource.Quantity{i: resource.int64Amount{value: 50, scale: resource.Scale(-3)}, s: "50m", Format: resource.Format("DecimalSI")}
+			Details: `{v1alpha1.RevisionSpec}.DeprecatedContainer.Resources.Requests["cpu"]:
+	-: resource.Quantity: "{i:{value:100 scale:-3} d:{Dec:<nil>} s:100m Format:DecimalSI}"
+	+: resource.Quantity: "{i:{value:50 scale:-3} d:{Dec:<nil>} s:50m Format:DecimalSI}"
 `,
 		},
 	}, {
 		name: "bad (container image change)",
 		new: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		old: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "busybox",
 				},
-				ConcurrencyModel: "Multi",
 			},
 		},
 		want: &apis.FieldError{
 			Message: "Immutable fields changed (-old +new)",
 			Paths:   []string{"spec"},
-			Details: `{v1alpha1.RevisionSpec}.Container.Image:
+			Details: `{v1alpha1.RevisionSpec}.DeprecatedContainer.Image:
 	-: "busybox"
 	+: "helloworld"
 `,
@@ -658,54 +614,103 @@ func TestImmutableFields(t *testing.T) {
 	}, {
 		name: "bad (concurrency model change)",
 		new: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
+				DeprecatedConcurrencyModel: "Multi",
 			},
 		},
 		old: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Single",
+				DeprecatedConcurrencyModel: "Single",
 			},
 		},
 		want: &apis.FieldError{
 			Message: "Immutable fields changed (-old +new)",
 			Paths:   []string{"spec"},
-			Details: `{v1alpha1.RevisionSpec}.ConcurrencyModel:
-	-: v1alpha1.RevisionRequestConcurrencyModelType("Single")
-	+: v1alpha1.RevisionRequestConcurrencyModelType("Multi")
+			Details: `{v1alpha1.RevisionSpec}.DeprecatedConcurrencyModel:
+	-: "Single"
+	+: "Multi"
+`,
+		},
+	}, {
+		name: "bad (new field added)",
+		new: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
+			Spec: RevisionSpec{
+				DeprecatedContainer: &corev1.Container{
+					Image: "helloworld",
+				},
+				RevisionSpec: v1beta1.RevisionSpec{
+					ContainerConcurrency: 100,
+				},
+			},
+		},
+		old: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
+			Spec: RevisionSpec{
+				DeprecatedContainer: &corev1.Container{
+					Image: "helloworld",
+				},
+			},
+		},
+		want: &apis.FieldError{
+			Message: "Immutable fields changed (-old +new)",
+			Paths:   []string{"spec"},
+			Details: `{v1alpha1.RevisionSpec}.RevisionSpec.ContainerConcurrency:
+	-: "0"
+	+: "100"
 `,
 		},
 	}, {
 		name: "bad (multiple changes)",
 		new: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "helloworld",
 				},
-				ConcurrencyModel: "Multi",
+				RevisionSpec: v1beta1.RevisionSpec{
+					ContainerConcurrency: 100,
+				},
 			},
 		},
 		old: &Revision{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "foo",
+			},
 			Spec: RevisionSpec{
-				Container: corev1.Container{
+				DeprecatedContainer: &corev1.Container{
 					Image: "busybox",
 				},
-				ConcurrencyModel: "Single",
+				RevisionSpec: v1beta1.RevisionSpec{
+					ContainerConcurrency: 1,
+				},
 			},
 		},
 		want: &apis.FieldError{
 			Message: "Immutable fields changed (-old +new)",
 			Paths:   []string{"spec"},
-			Details: `{v1alpha1.RevisionSpec}.ConcurrencyModel:
-	-: v1alpha1.RevisionRequestConcurrencyModelType("Single")
-	+: v1alpha1.RevisionRequestConcurrencyModelType("Multi")
-{v1alpha1.RevisionSpec}.Container.Image:
+			Details: `{v1alpha1.RevisionSpec}.RevisionSpec.ContainerConcurrency:
+	-: "1"
+	+: "100"
+{v1alpha1.RevisionSpec}.DeprecatedContainer.Image:
 	-: "busybox"
 	+: "helloworld"
 `,
@@ -714,10 +719,36 @@ func TestImmutableFields(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got := test.new.CheckImmutableFields(test.old)
+			ctx := context.Background()
+			ctx = apis.WithinUpdate(ctx, test.old)
+			if test.wc != nil {
+				ctx = test.wc(ctx)
+			}
+			got := test.new.Validate(ctx)
 			if diff := cmp.Diff(test.want.Error(), got.Error()); diff != "" {
 				t.Errorf("Validate (-want, +got) = %v", diff)
 			}
 		})
+	}
+}
+
+func TestRevisionProtocolType(t *testing.T) {
+	tests := []struct {
+		p    net.ProtocolType
+		want *apis.FieldError
+	}{{
+		net.ProtocolH2C, nil,
+	}, {
+		net.ProtocolHTTP1, nil,
+	}, {
+		net.ProtocolType(""), apis.ErrInvalidValue("", apis.CurrentField),
+	}, {
+		net.ProtocolType("token-ring"), apis.ErrInvalidValue("token-ring", apis.CurrentField),
+	}}
+	for _, test := range tests {
+		e := test.p.Validate(context.Background())
+		if got, want := e.Error(), test.want.Error(); !cmp.Equal(got, want) {
+			t.Errorf("Got = %v, want: %v, diff: %s", got, want, cmp.Diff(got, want))
+		}
 	}
 }

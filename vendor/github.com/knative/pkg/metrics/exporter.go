@@ -1,12 +1,9 @@
 /*
 Copyright 2018 The Knative Authors
-
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-
     http://www.apache.org/licenses/LICENSE-2.0
-
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -18,25 +15,25 @@ package metrics
 
 import (
 	"fmt"
-	"net/http"
 	"sync"
 
-	"contrib.go.opencensus.io/exporter/stackdriver"
-	"go.opencensus.io/exporter/prometheus"
 	"go.opencensus.io/stats/view"
 	"go.uber.org/zap"
-	monitoredrespb "google.golang.org/genproto/googleapis/api/monitoredres"
 )
 
 var (
 	curMetricsExporter view.Exporter
 	curMetricsConfig   *metricsConfig
-	curPromSrv         *http.Server
 	metricsMux         sync.Mutex
 )
 
+type flushable interface {
+	// Flush waits for metrics to be uploaded.
+	Flush()
+}
+
 // newMetricsExporter gets a metrics exporter based on the config.
-func newMetricsExporter(config *metricsConfig, logger *zap.SugaredLogger) error {
+func newMetricsExporter(config *metricsConfig, logger *zap.SugaredLogger) (view.Exporter, error) {
 	// If there is a Prometheus Exporter server running, stop it.
 	resetCurPromSrv()
 	ce := getCurMetricsExporter()
@@ -56,74 +53,9 @@ func newMetricsExporter(config *metricsConfig, logger *zap.SugaredLogger) error 
 		err = fmt.Errorf("Unsupported metrics backend %v", config.backendDestination)
 	}
 	if err != nil {
-		return err
-	}
-	existingConfig := getCurMetricsConfig()
-	setCurMetricsExporterAndConfig(e, config)
-	logger.Infof("Successfully updated the metrics exporter; old config: %v; new config %v", existingConfig, config)
-	return nil
-}
-
-func newStackdriverExporter(config *metricsConfig, logger *zap.SugaredLogger) (view.Exporter, error) {
-	e, err := stackdriver.NewExporter(stackdriver.Options{
-		ProjectID:    config.stackdriverProjectID,
-		MetricPrefix: config.domain + "/" + config.component,
-		Resource: &monitoredrespb.MonitoredResource{
-			Type: "global",
-		},
-		DefaultMonitoringLabels: &stackdriver.Labels{},
-	})
-	if err != nil {
-		logger.Error("Failed to create the Stackdriver exporter.", zap.Error(err))
 		return nil, err
 	}
-	logger.Infof("Created Opencensus Stackdriver exporter with config %v", config)
 	return e, nil
-}
-
-func newPrometheusExporter(config *metricsConfig, logger *zap.SugaredLogger) (view.Exporter, error) {
-	e, err := prometheus.NewExporter(prometheus.Options{Namespace: config.component})
-	if err != nil {
-		logger.Error("Failed to create the Prometheus exporter.", zap.Error(err))
-		return nil, err
-	}
-	logger.Infof("Created Opencensus Prometheus exporter with config: %v. Start the server for Prometheus exporter.", config)
-	// Start the server for Prometheus scraping
-	go func() {
-		srv := startNewPromSrv(e)
-		srv.ListenAndServe()
-	}()
-	return e, nil
-}
-
-func getCurPromSrv() *http.Server {
-	metricsMux.Lock()
-	defer metricsMux.Unlock()
-	return curPromSrv
-}
-
-func resetCurPromSrv() {
-	metricsMux.Lock()
-	defer metricsMux.Unlock()
-	if curPromSrv != nil {
-		curPromSrv.Close()
-		curPromSrv = nil
-	}
-}
-
-func startNewPromSrv(e *prometheus.Exporter) *http.Server {
-	sm := http.NewServeMux()
-	sm.Handle("/metrics", e)
-	metricsMux.Lock()
-	defer metricsMux.Unlock()
-	if curPromSrv != nil {
-		curPromSrv.Close()
-	}
-	curPromSrv = &http.Server{
-		Addr:    ":9090",
-		Handler: sm,
-	}
-	return curPromSrv
 }
 
 func getCurMetricsExporter() view.Exporter {
@@ -132,22 +64,43 @@ func getCurMetricsExporter() view.Exporter {
 	return curMetricsExporter
 }
 
-func setCurMetricsExporterAndConfig(e view.Exporter, c *metricsConfig) {
+func setCurMetricsExporter(e view.Exporter) {
 	metricsMux.Lock()
 	defer metricsMux.Unlock()
 	view.RegisterExporter(e)
-	if c != nil {
-		view.SetReportingPeriod(c.reportingPeriod)
-	} else {
-		// Setting to 0 enables the default behavior.
-		view.SetReportingPeriod(0)
-	}
 	curMetricsExporter = e
-	curMetricsConfig = c
 }
 
 func getCurMetricsConfig() *metricsConfig {
 	metricsMux.Lock()
 	defer metricsMux.Unlock()
 	return curMetricsConfig
+}
+
+func setCurMetricsConfig(c *metricsConfig) {
+	metricsMux.Lock()
+	defer metricsMux.Unlock()
+	if c != nil {
+		view.SetReportingPeriod(c.reportingPeriod)
+	} else {
+		// Setting to 0 enables the default behavior.
+		view.SetReportingPeriod(0)
+	}
+	curMetricsConfig = c
+}
+
+// FlushExporter waits for exported data to be uploaded.
+// This should be called before the process shuts down or exporter is replaced.
+// Return value indicates whether the exporter is flushable or not.
+func FlushExporter() bool {
+	e := getCurMetricsExporter()
+	if e == nil {
+		return false
+	}
+
+	if f, ok := e.(flushable); ok {
+		f.Flush()
+		return true
+	}
+	return false
 }

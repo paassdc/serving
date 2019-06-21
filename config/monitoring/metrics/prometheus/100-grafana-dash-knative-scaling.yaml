@@ -17,6 +17,8 @@ kind: ConfigMap
 metadata:
   name: scaling-config
   namespace: knative-monitoring
+  labels:
+    serving.knative.dev/release: devel
 data:
   scaling-dashboard.json: |+
       {  
@@ -127,7 +129,7 @@ data:
                      "steppedLine":true,
                      "targets":[  
                         {  
-                           "expr":"sum(autoscaler_actual_pod_count{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
+                           "expr":"sum(autoscaler_actual_pods{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
                            "format":"time_series",
                            "interval":"1s",
                            "intervalFactor":1,
@@ -135,7 +137,7 @@ data:
                            "refId":"A"
                         },
                         {  
-                           "expr":"sum(autoscaler_requested_pod_count{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
+                           "expr":"sum(autoscaler_requested_pods{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
                            "format":"time_series",
                            "interval":"1s",
                            "intervalFactor":1,
@@ -466,14 +468,14 @@ data:
                      "steppedLine":true,
                      "targets":[  
                         {  
-                           "expr":"sum(autoscaler_desired_pod_count{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"}) ",
+                           "expr":"sum(autoscaler_desired_pods{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"}) ",
                            "format":"time_series",
                            "intervalFactor":1,
                            "legendFormat":"Desired Pods",
                            "refId":"A"
                         },
                         {  
-                           "expr":"sum(autoscaler_observed_pod_count{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
+                           "expr":"sum(autoscaler_observed_pods{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
                            "format":"time_series",
                            "intervalFactor":1,
                            "legendFormat":"Observed Pods",
@@ -577,7 +579,7 @@ data:
                      "steppedLine":true,
                      "targets":[  
                         {  
-                           "expr":"sum(autoscaler_observed_stable_concurrency{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
+                           "expr":"sum(autoscaler_stable_request_concurrency{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
                            "format":"time_series",
                            "interval":"1s",
                            "intervalFactor":1,
@@ -585,7 +587,7 @@ data:
                            "refId":"A"
                         },
                         {  
-                           "expr":"sum(autoscaler_observed_panic_concurrency{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
+                           "expr":"sum(autoscaler_panic_request_concurrency{namespace_name=\"$namespace\", configuration_name=\"$configuration\", revision_name=\"$revision\"})",
                            "format":"time_series",
                            "interval":"1s",
                            "intervalFactor":1,
@@ -979,7 +981,7 @@ data:
                   "options":[  
 
                   ],
-                  "query":"label_values(autoscaler_observed_pod_count, namespace_name)",
+                  "query":"label_values(autoscaler_desired_pods, namespace_name)",
                   "refresh":1,
                   "regex":"",
                   "sort":1,
@@ -1005,7 +1007,7 @@ data:
                   "options":[  
 
                   ],
-                  "query":"label_values(autoscaler_observed_pod_count{namespace_name=\"$namespace\"}, configuration_name)",
+                  "query":"label_values(autoscaler_desired_pods{namespace_name=\"$namespace\"}, configuration_name)",
                   "refresh":1,
                   "regex":"",
                   "sort":1,
@@ -1031,7 +1033,7 @@ data:
                   "options":[  
 
                   ],
-                  "query":"label_values(autoscaler_observed_pod_count{namespace_name=\"$namespace\", configuration_name=\"$configuration\"}, revision_name)",
+                  "query":"label_values(autoscaler_desired_pods{namespace_name=\"$namespace\", configuration_name=\"$configuration\"}, revision_name)",
                   "refresh":1,
                   "regex":"",
                   "sort":2,

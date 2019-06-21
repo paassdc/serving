@@ -16,40 +16,122 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
-	kpa "github.com/knative/serving/pkg/apis/autoscaling/v1alpha1"
+	"github.com/knative/serving/pkg/apis/serving"
+	"github.com/knative/serving/pkg/autoscaler"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubeinformers "k8s.io/client-go/informers"
+	fakeK8s "k8s.io/client-go/kubernetes/fake"
 )
 
-func TestLabelValueOrEmpty(t *testing.T) {
-	kpa := &kpa.PodAutoscaler{}
-	kpa.Labels = make(map[string]string)
-	kpa.Labels["test1"] = "test1val"
-	kpa.Labels["test2"] = ""
+const (
+	testNamespace = "test-namespace"
+	testRevision  = "test-Revision"
+)
 
-	cases := []struct {
-		name string
-		key  string
-		want string
+func TestUniscalerFactoryFailures(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   string
 	}{{
-		name: "existing key",
-		key:  "test1",
-		want: "test1val",
+		"nil labels", nil, fmt.Sprintf("label %q not found or empty in Decider", serving.ConfigurationLabelKey),
 	}, {
-		name: "existing empty key",
-		key:  "test2",
-		want: "",
+		"empty labels", map[string]string{}, fmt.Sprintf("label %q not found or empty in Decider", serving.ConfigurationLabelKey),
 	}, {
-		name: "non-existent key",
-		key:  "test4",
-		want: "",
+		"config missing", map[string]string{
+			"some-unimportant-label": "lo-digo",
+		},
+		fmt.Sprintf("label %q not found or empty in Decider", serving.ConfigurationLabelKey),
+	}, {
+		"values not ascii", map[string]string{
+			serving.ServiceLabelKey:       "la",
+			serving.ConfigurationLabelKey: "verité",
+		}, "invalid value: only ASCII characters accepted",
+	}, {
+		"too long of a value", map[string]string{
+			serving.ServiceLabelKey:       "cat is ",
+			serving.ConfigurationLabelKey: "l" + strings.Repeat("o", 253) + "ng",
+		}, "max length must be 255 characters",
 	}}
 
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := labelValueOrEmpty(kpa, c.key); got != c.want {
-				t.Errorf("%q expected: %v got: %v", c.name, got, c.want)
+	uniScalerFactory := getTestUniScalerFactory()
+	decider := &autoscaler.Decider{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      testRevision,
+		},
+		Spec: autoscaler.DeciderSpec{
+			ServiceName: "wholesome-service",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			decider.Labels = test.labels
+
+			_, err := uniScalerFactory(decider)
+			if err == nil {
+				t.Fatal("No error was returned")
+			}
+			if got, want := err.Error(), test.want; !strings.Contains(got, want) {
+				t.Errorf("Error = %q, want to contain = %q", got, want)
 			}
 		})
 	}
+
+	// Now blank out service name and give correct labels.
+	decider.Spec.ServiceName = ""
+	decider.Labels = map[string]string{
+		serving.RevisionLabelKey:      testRevision,
+		serving.ServiceLabelKey:       "some-nice-service",
+		serving.ConfigurationLabelKey: "test-config",
+	}
+
+	_, err := uniScalerFactory(decider)
+	if err == nil {
+		t.Fatal("No error was returned")
+	}
+	if got, want := err.Error(), "decider has empty ServiceName"; !strings.Contains(got, want) {
+		t.Errorf("Error = %q, want to contain = %q", got, want)
+	}
+}
+
+func TestUniScalerFactoryFunc(t *testing.T) {
+	uniScalerFactory := getTestUniScalerFactory()
+	for _, srv := range []string{"some", ""} {
+		decider := &autoscaler.Decider{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: testNamespace,
+				Name:      testRevision,
+				Labels: map[string]string{
+					serving.RevisionLabelKey:      testRevision,
+					serving.ServiceLabelKey:       srv,
+					serving.ConfigurationLabelKey: "test-config",
+				},
+			},
+			Spec: autoscaler.DeciderSpec{
+				ServiceName: "magic-services-offered",
+			},
+		}
+
+		if _, err := uniScalerFactory(decider); err != nil {
+			t.Errorf("got error from uniScalerFactory: %v", err)
+		}
+	}
+}
+
+func getTestUniScalerFactory() func(decider *autoscaler.Decider) (autoscaler.UniScaler, error) {
+	kubeClient := fakeK8s.NewSimpleClientset()
+	kubeInformer := kubeinformers.NewSharedInformerFactory(kubeClient, 0)
+	return uniScalerFactoryFunc(kubeInformer.Core().V1().Endpoints(), &testMetricClient{})
+}
+
+type testMetricClient struct{}
+
+func (t *testMetricClient) StableAndPanicConcurrency(key string) (float64, float64, error) {
+	return 1.0, 1.0, nil
 }

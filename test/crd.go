@@ -19,16 +19,10 @@ package test
 // crd contains functions that construct boilerplate CRD definitions.
 
 import (
-	"math/rand"
-	"sync"
-	"time"
+	"strings"
+	"testing"
 
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"github.com/knative/pkg/test/logging"
-	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
+	"github.com/knative/pkg/test/helpers"
 )
 
 // ResourceNames holds names of various resources.
@@ -42,219 +36,22 @@ type ResourceNames struct {
 	Image         string
 }
 
-// ResourceObjects holds types of the resource objects.
-type ResourceObjects struct {
-	Route    *v1alpha1.Route
-	Config   *v1alpha1.Configuration
-	Service  *v1alpha1.Service
-	Revision *v1alpha1.Revision
-}
-
-// Route returns a Route object in namespace using the route and configuration
-// names in names.
-func Route(namespace string, names ResourceNames) *v1alpha1.Route {
-	return &v1alpha1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      names.Route,
-		},
-		Spec: v1alpha1.RouteSpec{
-			Traffic: []v1alpha1.TrafficTarget{
-				{
-					Name:              names.TrafficTarget,
-					ConfigurationName: names.Config,
-					Percent:           100,
-				},
-			},
-		},
-	}
-}
-
-// BlueGreenRoute returns a Route object in namespace using the route and configuration
-// names in names. Traffic is split evenly between blue and green.
-func BlueGreenRoute(namespace string, names, blue, green ResourceNames) *v1alpha1.Route {
-	return &v1alpha1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      names.Route,
-		},
-		Spec: v1alpha1.RouteSpec{
-			Traffic: []v1alpha1.TrafficTarget{{
-				Name:         blue.TrafficTarget,
-				RevisionName: blue.Revision,
-				Percent:      50,
-			}, {
-				Name:         green.TrafficTarget,
-				RevisionName: green.Revision,
-				Percent:      50,
-			}},
-		},
-	}
-}
-
-// Configuration returns a Configuration object in namespace with the name names.Config
-// that uses the image specified by imagePath.
-func Configuration(namespace string, names ResourceNames, imagePath string, options *Options) *v1alpha1.Configuration {
-	config := &v1alpha1.Configuration{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      names.Config,
-		},
-		Spec: v1alpha1.ConfigurationSpec{
-			RevisionTemplate: v1alpha1.RevisionTemplateSpec{
-				Spec: v1alpha1.RevisionSpec{
-					Container: corev1.Container{
-						Image:     imagePath,
-						Resources: options.ContainerResources,
-					},
-					ContainerConcurrency: v1alpha1.RevisionContainerConcurrencyType(options.ContainerConcurrency),
-				},
-			},
-		},
-	}
-
-	if options.RevisionTimeout > 0 {
-		config.Spec.RevisionTemplate.Spec.TimeoutSeconds = &metav1.Duration{Duration: options.RevisionTimeout}
-	}
-
-	if options.EnvVars != nil && len(options.EnvVars) > 0 {
-		config.Spec.RevisionTemplate.Spec.Container.Env = options.EnvVars
-	}
-	return config
-}
-
-// ConfigurationWithBuild returns a Configurtion object in the `namespace`
-// with the name `names.Config` that uses the provided Build spec `build`
-// and image specified by `imagePath`.
-func ConfigurationWithBuild(namespace string, names ResourceNames, build *v1alpha1.RawExtension, imagePath string) *v1alpha1.Configuration {
-	return &v1alpha1.Configuration{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      names.Config,
-		},
-		Spec: v1alpha1.ConfigurationSpec{
-			Build: build,
-			RevisionTemplate: v1alpha1.RevisionTemplateSpec{
-				Spec: v1alpha1.RevisionSpec{
-					Container: corev1.Container{
-						Image: imagePath,
-					},
-				},
-			},
-		},
-	}
-}
-
-// LatestService returns a RunLatest Service object in namespace with the name names.Service
-// that uses the image specified by imagePath.
-func LatestService(namespace string, names ResourceNames, imagePath string) *v1alpha1.Service {
-	return &v1alpha1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      names.Service,
-		},
-		Spec: v1alpha1.ServiceSpec{
-			RunLatest: &v1alpha1.RunLatestType{
-				Configuration: v1alpha1.ConfigurationSpec{
-					RevisionTemplate: v1alpha1.RevisionTemplateSpec{
-						Spec: v1alpha1.RevisionSpec{
-							Container: corev1.Container{
-								Image: imagePath,
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-// LatestServiceWithResources returns a RunLatest Service object in namespace with the name names.Service
-// that uses the image specified by imagePath, and small constant resources.
-func LatestServiceWithResources(namespace string, names ResourceNames, imagePath string) *v1alpha1.Service {
-	svc := LatestService(namespace, names, imagePath)
-	svc.Spec.RunLatest.Configuration.RevisionTemplate.Spec.Container.Resources = corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("10m"),
-			corev1.ResourceMemory: resource.MustParse("50Mi"),
-		},
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse("10m"),
-			corev1.ResourceMemory: resource.MustParse("20Mi"),
-		},
-	}
-	return svc
-}
-
-// ReleaseService returns a Release Service object in namespace with the name names.Service that uses
-// the image specifeid by imagePath. It also takes a list of 1-2 revisons and a rolloutPercent to be
-// used to configure routing
-func ReleaseService(svc *v1alpha1.Service, revisions []string, rolloutPercent int) *v1alpha1.Service {
-	var config v1alpha1.ConfigurationSpec
-	if svc.Spec.RunLatest != nil {
-		config = svc.Spec.RunLatest.Configuration
-	} else if svc.Spec.Release != nil {
-		config = svc.Spec.Release.Configuration
-	} else if svc.Spec.Pinned != nil {
-		config = svc.Spec.Pinned.Configuration
-	}
-	return &v1alpha1.Service{
-		ObjectMeta: svc.ObjectMeta,
-		Spec: v1alpha1.ServiceSpec{
-			Release: &v1alpha1.ReleaseType{
-				Revisions:      revisions,
-				RolloutPercent: rolloutPercent,
-				Configuration:  config,
-			},
-		},
-	}
-}
-
-// ManualService returns a Manual Service object in namespace with the name names.Service
-func ManualService(svc *v1alpha1.Service) *v1alpha1.Service {
-	return &v1alpha1.Service{
-		ObjectMeta: svc.ObjectMeta,
-		Spec: v1alpha1.ServiceSpec{
-			Manual: &v1alpha1.ManualType{},
-		},
-	}
-}
-
-const (
-	letterBytes   = "abcdefghijklmnopqrstuvwxyz"
-	randSuffixLen = 8
-)
-
-// r is used by AppendRandomString to generate a random string. It is seeded with the time
-// at import so the strings will be different between test runs.
-var (
-	r        *rand.Rand
-	rndMutex *sync.Mutex
-)
-
-// once is used to initialize r
-var once sync.Once
-
-func initSeed(logger *logging.BaseLogger) func() {
-	return func() {
-		seed := time.Now().UTC().UnixNano()
-		logger.Infof("Seeding rand.Rand with %d", seed)
-		r = rand.New(rand.NewSource(seed))
-		rndMutex = &sync.Mutex{}
-	}
-}
-
 // AppendRandomString will generate a random string that begins with prefix. This is useful
 // if you want to make sure that your tests can run at the same time against the same
 // environment without conflicting. This method will seed rand with the current time when
 // called for the first time.
-func AppendRandomString(prefix string, logger *logging.BaseLogger) string {
-	once.Do(initSeed(logger))
-	suffix := make([]byte, randSuffixLen)
-	rndMutex.Lock()
-	for i := range suffix {
-		suffix[i] = letterBytes[r.Intn(len(letterBytes))]
-	}
-	rndMutex.Unlock()
-	return prefix + string(suffix)
+var AppendRandomString = helpers.AppendRandomString
+
+// MakeK8sNamePrefix will convert each chunk of non-alphanumeric character into a single dash
+// and also convert camelcase tokens into dash-delimited lowercase tokens.
+var MakeK8sNamePrefix = helpers.MakeK8sNamePrefix
+
+// ObjectNameForTest generates a random object name based on the test name.
+var ObjectNameForTest = helpers.ObjectNameForTest
+
+// SubServiceNameForTest generates a random service name based on the test name and
+// the given subservice name.
+func SubServiceNameForTest(t *testing.T, subsvc string) string {
+	fullPrefix := strings.TrimPrefix(t.Name(), "Test") + "-" + subsvc
+	return AppendRandomString(MakeK8sNamePrefix(fullPrefix))
 }

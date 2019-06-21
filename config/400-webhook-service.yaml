@@ -17,11 +17,12 @@ kind: Service
 metadata:
   labels:
     role: webhook
+    serving.knative.dev/release: devel
   name: webhook
   namespace: knative-serving
 spec:
   ports:
     - port: 443
-      targetPort: 443
+      targetPort: 8443
   selector:
     role: webhook

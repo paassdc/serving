@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"context"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -78,26 +79,6 @@ func TestPodAutoscalerDefaulting(t *testing.T) {
 			},
 		},
 	}, {
-		name: "fall back to concurrency model",
-		in: &PodAutoscaler{
-			Spec: PodAutoscalerSpec{
-				ConcurrencyModel:     "Single",
-				ContainerConcurrency: 0, // unspecified
-			},
-		},
-		want: &PodAutoscaler{
-			ObjectMeta: metav1.ObjectMeta{
-				Annotations: map[string]string{
-					autoscaling.ClassAnnotationKey:  autoscaling.KPA,
-					autoscaling.MetricAnnotationKey: autoscaling.Concurrency,
-				},
-			},
-			Spec: PodAutoscalerSpec{
-				ConcurrencyModel:     "Single",
-				ContainerConcurrency: 1,
-			},
-		},
-	}, {
 		name: "hpa class is not overwritten and defaults to cpu",
 		in: &PodAutoscaler{
 			ObjectMeta: metav1.ObjectMeta{
@@ -122,7 +103,7 @@ func TestPodAutoscalerDefaulting(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := test.in
-			got.SetDefaults()
+			got.SetDefaults(context.Background())
 			if diff := cmp.Diff(test.want, got); diff != "" {
 				t.Errorf("SetDefaults (-want, +got) = %v", diff)
 			}
